@@ -1,0 +1,371 @@
+# Deploy a released version to production.
+#
+# This repository has no production host yet, and this workflow is written to
+# be honest about that rather than to pretend otherwise. What it does today:
+#
+#   1. resolves and validates the version being deployed
+#   2. proves the images for that version actually exist in the registry
+#   3. renders the exact Compose file the host should run, pinned to that
+#      version with the build contexts stripped, and uploads it as an artifact
+#   4. stops at the `production` environment gate for an approval
+#   5. runs the real deploy -- currently a clearly marked placeholder
+#   6. health-checks the deployment if a PRODUCTION_URL is configured
+#
+# Steps 5 and 6 are the only ones that need infrastructure, and neither fails
+# the run when that infrastructure is absent: they report what they skipped
+# and why. Steps 1-4 are real work and do fail if something is wrong.
+#
+# The approval gate: create an environment named `production` under
+# Settings -> Environments and add yourself as a required reviewer. Until you
+# do, GitHub creates the environment implicitly on the first run and the
+# deploy proceeds without pausing.
+#
+# Optional repository variables:
+#   PRODUCTION_URL   e.g. https://taskflow.example.com -- enables the
+#                    post-deploy health check
+#   DEPLOY_REGISTRY  ghcr or dockerhub (default: ghcr)
+
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Released version to deploy, e.g. 1.0.0.'
+        required: true
+        type: string
+      registry:
+        description: 'Registry to deploy the images from.'
+        required: false
+        type: choice
+        default: ghcr
+        options:
+          - ghcr
+          - dockerhub
+      skip-health-check:
+        description: 'Skip the post-deploy health check.'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      registry:
+        required: false
+        type: string
+        default: ghcr
+      skip-health-check:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One production deploy at a time, and never cancel one in flight.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      api-image: ${{ steps.plan.outputs.api-image }}
+      web-image: ${{ steps.plan.outputs.web-image }}
+      namespace: ${{ steps.plan.outputs.namespace }}
+      registry: ${{ steps.plan.outputs.registry }}
+    steps:
+      - name: Resolve the deployment
+        id: plan
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REGISTRY: ${{ inputs.registry }}
+          VAR_REGISTRY: ${{ vars.DEPLOY_REGISTRY }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          version="${INPUT_VERSION#v}"
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'${version}' is not a semantic version. Deploy a released version, e.g. 1.0.0."
+            exit 1
+          fi
+
+          registry="${INPUT_REGISTRY:-${VAR_REGISTRY:-ghcr}}"
+          case "$registry" in
+            ghcr)
+              namespace="ghcr.io/$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
+              ;;
+            dockerhub)
+              namespace="${DOCKERHUB_NAMESPACE:-${DOCKERHUB_USERNAME:-}}"
+              if [ -z "$namespace" ]; then
+                echo "::error::Deploying from Docker Hub needs either the DOCKERHUB_NAMESPACE variable or the DOCKERHUB_USERNAME secret."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unknown registry '${registry}'. Use ghcr or dockerhub."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "version=${version}"
+            echo "registry=${registry}"
+            echo "namespace=${namespace}"
+            echo "api-image=${namespace}/taskflow-api:${version}"
+            echo "web-image=${namespace}/taskflow-web:${version}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Deployment plan"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`${version}\` |"
+            echo "| Registry | \`${registry}\` |"
+            echo "| API image | \`${namespace}/taskflow-api:${version}\` |"
+            echo "| Web image | \`${namespace}/taskflow-web:${version}\` |"
+            echo "| Triggered by | @${GITHUB_ACTOR} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify the images and render the Compose file
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [plan]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        if: needs.plan.outputs.registry == 'ghcr'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: needs.plan.outputs.registry == 'dockerhub'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Confirm both image tags exist
+        # A deploy that points at a tag nobody published would fail on the
+        # host instead, long after the approval. Catch it here.
+        env:
+          API_IMAGE: ${{ needs.plan.outputs.api-image }}
+          WEB_IMAGE: ${{ needs.plan.outputs.web-image }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for image in "$API_IMAGE" "$WEB_IMAGE"; do
+            if docker buildx imagetools inspect "$image" > /dev/null 2>&1; then
+              digest=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}' 2>/dev/null || echo 'unknown')
+              echo "found   ${image}  ${digest}"
+            else
+              echo "::error::${image} does not exist in the registry. Publish it before deploying."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Render the production Compose file
+        env:
+          NAMESPACE: ${{ needs.plan.outputs.namespace }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # The base file already builds its image names out of these two.
+          cp .env.example .env
+          export REGISTRY_NAMESPACE="$NAMESPACE"
+          export TASKFLOW_VERSION="$VERSION"
+
+          docker compose -f docker-compose.yml config > compose.resolved.yml
+
+          # Strip the build contexts: the host pulls published images and has
+          # no source tree to build from. yq ships on the GitHub runner image;
+          # if it ever stops doing so, the unstripped file is still usable.
+          if command -v yq > /dev/null 2>&1; then
+            yq 'del(.services[].build)' compose.resolved.yml > docker-compose.production.yml
+          else
+            echo "::warning::yq not found; the rendered file keeps its build: sections."
+            cp compose.resolved.yml docker-compose.production.yml
+          fi
+
+          echo "::group::docker-compose.production.yml"
+          cat docker-compose.production.yml
+          echo "::endgroup::"
+
+          grep -E '^\s+image:' docker-compose.production.yml
+
+      - name: Upload the deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-compose-${{ needs.plan.outputs.version }}
+          path: docker-compose.production.yml
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [plan, verify]
+    # The approval gate. Everything above this line is read-only; nothing
+    # below it runs until a required reviewer on the `production` environment
+    # approves the run.
+    environment: production
+    steps:
+      - name: Download the rendered Compose file
+        uses: actions/download-artifact@v4
+        with:
+          name: production-compose-${{ needs.plan.outputs.version }}
+
+      - name: Deploy
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          API_IMAGE: ${{ needs.plan.outputs.api-image }}
+          WEB_IMAGE: ${{ needs.plan.outputs.web-image }}
+        run: |
+          set -euo pipefail
+
+          echo "Deploying TaskFlow ${VERSION}"
+          echo "  api: ${API_IMAGE}"
+          echo "  web: ${WEB_IMAGE}"
+          echo
+
+          # ===================================================================
+          # TODO: replace this block with the real deployment.
+          #
+          # The rendered docker-compose.production.yml is in the working
+          # directory, already pinned to the images verified above. Whichever
+          # target you settle on, this is the shape of it:
+          #
+          #   A Docker host over SSH
+          #     - add the DEPLOY_HOST / DEPLOY_USER / DEPLOY_SSH_KEY secrets
+          #     - install the key, scp docker-compose.production.yml and the
+          #       production .env to the host, then over ssh:
+          #           docker compose -f docker-compose.production.yml pull
+          #           docker compose -f docker-compose.production.yml up -d
+          #
+          #   Kubernetes (Phase 2 of the mentoring track)
+          #     - kubectl set image deployment/taskflow-api api=${API_IMAGE}
+          #     - kubectl rollout status deployment/taskflow-api
+          #
+          #   A managed platform (ECS, Cloud Run, App Service)
+          #     - authenticate with that provider's login action
+          #     - update the service to the verified image digests
+          # ===================================================================
+
+          echo "::warning::No deployment target is configured yet, so nothing was deployed. The rendered Compose file for this version is attached to this run as an artifact."
+
+          {
+            echo "### Deploy"
+            echo
+            echo "No deployment target is wired up yet, so this step was a no-op."
+            echo "Everything up to the gate is real: the images were verified and"
+            echo "\`docker-compose.production.yml\` for \`${VERSION}\` is attached to this run."
+            echo
+            echo "Replace the TODO block in \`.github/workflows/deploy-production.yml\` to make it live."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  health-check:
+    name: Post-deploy health check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [plan, deploy]
+    if: ${{ inputs.skip-health-check != true }}
+    steps:
+      - name: Check the deployment is serving
+        env:
+          PRODUCTION_URL: ${{ vars.PRODUCTION_URL }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PRODUCTION_URL" ]; then
+            echo "::notice::No PRODUCTION_URL repository variable is set, so there is nothing to health-check."
+            echo "Health check skipped: set the \`PRODUCTION_URL\` repository variable to enable it." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "Checking ${PRODUCTION_URL}/health"
+          ok=0
+          for attempt in $(seq 1 10); do
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 10 "${PRODUCTION_URL}/health" || echo 000)
+            if [ "$code" = "200" ] && grep -q '"status":"ok"' /tmp/health.json; then
+              ok=1
+              break
+            fi
+            echo "  attempt ${attempt}: HTTP ${code}"
+            sleep 6
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::${PRODUCTION_URL}/health did not return 200 {\"status\":\"ok\"} after 10 attempts."
+            {
+              echo "### Health check failed"
+              echo
+              echo "\`${PRODUCTION_URL}/health\` never came good. To roll back, re-run this"
+              echo "workflow with the previously deployed version."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Healthy."
+          {
+            echo "### Health check passed"
+            echo
+            echo "\`${PRODUCTION_URL}/health\` returned 200 for version \`${VERSION}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  report:
+    name: Deployment report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [plan, verify, deploy, health-check]
+    if: always()
+    steps:
+      - name: Summarise
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          VERIFY: ${{ needs.verify.result }}
+          DEPLOY: ${{ needs.deploy.result }}
+          HEALTH: ${{ needs.health-check.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Deployment report -- \`${VERSION:-unknown}\`"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| Verify images | \`${VERIFY}\` |"
+            echo "| Deploy | \`${DEPLOY}\` |"
+            echo "| Health check | \`${HEALTH}\` |"
+            echo
+            echo "**Rolling back:** re-run this workflow with the version that was live before."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if a stage did not succeed
+        if: contains(needs.*.result, 'failure')
+        run: exit 1
