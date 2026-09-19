@@ -1,0 +1,198 @@
+# No top-level `version:` key -- it is obsolete in Compose v2 and only
+# produces a deprecation warning. The Compose Specification is versionless.
+#
+# This is the BASE file: it describes the stack as it would run for real.
+# Local-development conveniences (bind mounts, live reload, published
+# database ports) live in docker-compose.override.yml, which Compose loads
+# automatically on top of this one. To run this file alone, prod-style:
+#
+#     docker compose -f docker-compose.yml up -d
+#
+# ---------------------------------------------------------------------------
+# A note on `deploy.resources`, used by every service below.
+#
+# `deploy.resources` is the Compose Specification form, and it is the one
+# worth learning because it maps 1:1 onto Kubernetes:
+#
+#     deploy.resources.limits        ->  resources.limits
+#     deploy.resources.reservations  ->  resources.requests
+#
+# The older non-swarm keys `mem_limit:` / `cpus:` do exactly the same job on
+# a local engine but have no Kubernetes counterpart, so they are deliberately
+# not used here.
+#
+# What a local (non-swarm) Compose v2 engine actually enforces:
+#   limits.cpus          -> enforced (docker run --cpus)
+#   limits.memory        -> enforced (docker run --memory), OOM-kills on breach
+#   reservations.memory  -> enforced as a soft floor (--memory-reservation)
+#   reservations.cpus    -> NOT enforced; kept because it is the value that
+#                           becomes resources.requests.cpu in Phase 2
+# ---------------------------------------------------------------------------
+
+services:
+  taskflow-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # Interpolated from .env at parse time, so no credential is written
+      # into this file. These must agree with the DB_* values the API reads.
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      # Named volume -> survives `docker compose down && up`. Anonymous or
+      # no volume would put the data in the container layer and lose it.
+      - taskflow-db-data:/var/lib/postgresql/data
+      # The official image runs everything in this directory on FIRST boot
+      # only, i.e. when the data volume is still empty. Read-only: the
+      # database has no reason to write to our schema file.
+      - ./api/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # -h 127.0.0.1 forces a TCP check on purpose. While init.sql is being
+      # applied the entrypoint runs a temporary server with listen_addresses
+      # empty, so it is reachable over the unix socket but not over TCP. A
+      # socket check would go healthy mid-init and let the API in too early.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          # The heaviest service: Postgres wants room for shared_buffers,
+          # the page cache and per-connection work_mem.
+          cpus: "0.75"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 256M
+    networks:
+      - taskflow-net
+    # Deliberately no `ports:`. Nothing outside the compose network needs to
+    # reach Postgres; publishing 5432 would expose the database to the host
+    # (and to the LAN). Use `docker compose exec taskflow-db psql` instead.
+
+  taskflow-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Both flags exist because of the memory limit below, and neither should
+    # be removed without removing that limit too:
+    #
+    #   --maxmemory 192mb  Redis does not read its cgroup limit. Left at the
+    #     default of 0 ("unlimited") it grows until the 256M ceiling and the
+    #     kernel OOM-kills the container. Capping it below the container
+    #     limit makes Redis evict instead, which is what a cache should do.
+    #   --save ""  disables RDB snapshots. This is a pure cache with a 30s
+    #     TTL, so there is nothing worth persisting, and a background save
+    #     forks the process -- a memory spike that a hard limit turns into a
+    #     kill.
+    command:
+      - redis-server
+      - --maxmemory
+      - 192mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 32M
+    networks:
+      - taskflow-net
+
+  taskflow-api:
+    # Tagged the way a published image is tagged, so `docker compose build`
+    # produces something a Phase 2 Pod spec could actually pull. Override the
+    # namespace in .env (REGISTRY_NAMESPACE=your-docker-hub-user) before
+    # pushing anywhere; the default keeps it purely local.
+    image: ${REGISTRY_NAMESPACE:-taskflow}/taskflow-api:${TASKFLOW_VERSION:-1.0.0}
+    build:
+      context: ./api
+    restart: unless-stopped
+    # Every connection detail comes from .env -- nothing is hard-coded here.
+    env_file:
+      - .env
+    # node would otherwise be PID 1 with no default SIGTERM handler, so
+    # `docker compose down` would stall for the full 10s grace period before
+    # a SIGKILL. init: true runs a tiny init that forwards signals properly.
+    init: true
+    depends_on:
+      taskflow-db:
+        condition: service_healthy
+      taskflow-cache:
+        condition: service_healthy
+    healthcheck:
+      # The image ships no curl on purpose; node is already there, so the
+      # probe costs nothing and adds no attack surface.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:' + (process.env.PORT || 4000) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          # Node sizes its old-space heap from the memory it can see, so a
+          # container limit is also an indirect heap cap. 512M leaves plenty
+          # of headroom for this workload.
+          cpus: "0.75"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+    networks:
+      - taskflow-net
+    # Also no `ports:`. The browser reaches the API through the nginx
+    # reverse proxy, so 4000 only needs to be reachable inside the network.
+
+  taskflow-web:
+    image: ${REGISTRY_NAMESPACE:-taskflow}/taskflow-web:${TASKFLOW_VERSION:-1.0.0}
+    build:
+      context: ./web
+    restart: unless-stopped
+    ports:
+      # host:container -- 8080 on the laptop maps to nginx's 80.
+      - "8080:80"
+    depends_on:
+      # Not just ordering: nginx resolves the taskflow-api hostname once, at
+      # startup, and exits with "host not found in upstream" if it is absent.
+      taskflow-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          # Nginx serving one static file and proxying is close to free.
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 16M
+    networks:
+      - taskflow-net
+
+networks:
+  taskflow-net:
+    name: taskflow-net
+    driver: bridge
+
+volumes:
+  taskflow-db-data:
+    name: taskflow-db-data
