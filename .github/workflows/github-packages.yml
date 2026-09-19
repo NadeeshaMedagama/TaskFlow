@@ -84,7 +84,7 @@ jobs:
             description: 'TaskFlow web tier. nginx serving the UI and reverse-proxying the API.'
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up QEMU
         # Only needed when a non-native architecture is in the platform list;
