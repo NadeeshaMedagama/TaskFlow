@@ -1,0 +1,365 @@
+# Publish this repository's action to the GitHub Marketplace.
+#
+# What is being published is ./action.yml at the repository root -- the
+# "TaskFlow Stack Smoke Test" composite action. GitHub requires that file to
+# sit at the root, which is why it is not under .github/.
+#
+# One thing this workflow deliberately does not claim to do. There is no API
+# for ticking "Publish this Action to the GitHub Marketplace" on a release;
+# that box is a one-time manual click in the release UI. Everything that CAN
+# be automated is automated here:
+#
+#   * every Marketplace requirement is validated before a tag is moved
+#   * the action is actually run, so a broken action is never published
+#   * the major version tag (v1) is created and kept pointing at the release
+#   * the release is created, and the exact link to finish the publish is
+#     printed in the job summary
+#
+# After the first manual tick, later releases are offered the same checkbox
+# and the listing updates from the tag this workflow moves.
+#
+# On the `release: published` trigger below: a release created by release.yml
+# is created with the default GITHUB_TOKEN, and events raised by that token do
+# not start other workflows. So that trigger fires for a release published by
+# hand from the UI, but not for one release.yml cut. After an automated
+# release, run this workflow from the Actions tab -- it resolves the latest
+# release tag on its own, so there is nothing to type.
+
+name: Publish Marketplace
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. 1.0.0. Defaults to the latest release tag.'
+        required: false
+        type: string
+        default: ''
+      dry-run:
+        description: 'Validate and test only -- do not move any tag or create a release.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marketplace-publish
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate the action metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      action-name: ${{ steps.validate.outputs.action-name }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the YAML parser
+        run: pip install --quiet pyyaml
+
+      - name: Validate action.yml against the Marketplace requirements
+        id: validate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          import yaml
+
+          errors = []
+          warnings = []
+
+          root = pathlib.Path('.')
+          candidates = [p for p in (root / 'action.yml', root / 'action.yaml') if p.exists()]
+
+          if not candidates:
+              errors.append('No action.yml (or action.yaml) at the repository root. '
+                            'The Marketplace only lists actions whose metadata file is at the root.')
+          elif len(candidates) == 2:
+              errors.append('Both action.yml and action.yaml exist. GitHub accepts exactly one.')
+
+          action = {}
+          if candidates:
+              path = candidates[0]
+              try:
+                  action = yaml.safe_load(path.read_text()) or {}
+              except yaml.YAMLError as exc:
+                  errors.append(f'{path} is not valid YAML: {exc}')
+
+          if action:
+              name = (action.get('name') or '').strip()
+              description = (action.get('description') or '').strip()
+              author = (action.get('author') or '').strip()
+
+              if not name:
+                  errors.append('`name` is required and must not be empty.')
+              if not description:
+                  errors.append('`description` is required; it is the one-line summary on the listing.')
+              if not author:
+                  warnings.append('`author` is not set. It is optional, but it shows on the listing.')
+
+              branding = action.get('branding') or {}
+              allowed_colors = {'white', 'yellow', 'blue', 'green', 'orange', 'red', 'purple', 'gray-dark'}
+              icon = (branding.get('icon') or '').strip()
+              color = (branding.get('color') or '').strip()
+
+              if not branding:
+                  errors.append('`branding` is required to list on the Marketplace; it needs an `icon` and a `color`.')
+              else:
+                  if not icon:
+                      errors.append('`branding.icon` is required (a Feather icon name, e.g. check-circle).')
+                  elif icon != icon.lower() or ' ' in icon:
+                      errors.append(f'`branding.icon` must be a lower-case Feather icon name; got {icon!r}.')
+                  if color not in allowed_colors:
+                      errors.append('`branding.color` must be one of: '
+                                    + ', '.join(sorted(allowed_colors))
+                                    + f'; got {color!r}.')
+
+              runs = action.get('runs') or {}
+              using = (runs.get('using') or '').strip()
+              if not using:
+                  errors.append('`runs.using` is required.')
+              elif using == 'composite':
+                  steps = runs.get('steps') or []
+                  if not steps:
+                      errors.append('A composite action needs at least one step under `runs.steps`.')
+                  for index, step in enumerate(steps):
+                      if 'run' in step and not step.get('shell'):
+                          label = step.get('name', f'#{index + 1}')
+                          errors.append(f'Composite step {label} has `run:` but no `shell:`, which GitHub rejects.')
+
+              for section in ('inputs', 'outputs'):
+                  for key, spec in (action.get(section) or {}).items():
+                      if not isinstance(spec, dict) or not (spec.get('description') or '').strip():
+                          errors.append(f'{section[:-1]} `{key}` has no description.')
+
+              if name:
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as handle:
+                      handle.write(f'action-name={name}\n')
+
+          if not list(root.glob('LICENSE*')):
+              warnings.append('There is no LICENSE file. Not required, but people reasonably '
+                              'expect one before they depend on an action.')
+
+          for warning in warnings:
+              print(f'::warning::{warning}')
+          for error in errors:
+              print(f'::error::{error}')
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a') as handle:
+                  handle.write('### Marketplace validation\n\n')
+                  handle.write(f'- errors: {len(errors)}\n')
+                  handle.write(f'- warnings: {len(warnings)}\n')
+
+          if errors:
+              sys.exit(1)
+
+          print('action.yml satisfies every Marketplace requirement that can be checked here.')
+          PY
+
+      - name: Check the repository is eligible
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          private=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.private')
+          if [ "$private" = "true" ]; then
+            echo "::warning::${GITHUB_REPOSITORY} is private. The Marketplace only lists actions from public repositories -- make it public before finishing the publish."
+          else
+            echo "Repository is public."
+          fi
+          echo "::notice::The action's name must be unique across the whole Marketplace. If the publish form rejects it, rename it in action.yml and re-run."
+
+  # ---------------------------------------------------------------------------
+  test:
+    name: Run the action
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [validate]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Use the action exactly as a consumer would
+        id: action
+        uses: ./
+        with:
+          compose-files: 'docker-compose.yml'
+          base-url: 'http://localhost:8080'
+          build: 'true'
+          teardown: 'true'
+
+      - name: Assert the action reported a pass
+        env:
+          RESULT: ${{ steps.action.outputs.result }}
+          PASSED: ${{ steps.action.outputs.passed }}
+          FAILED: ${{ steps.action.outputs.failed }}
+        run: |
+          set -euo pipefail
+          echo "result=${RESULT} passed=${PASSED} failed=${FAILED}"
+          if [ "$RESULT" != "passed" ]; then
+            echo "::error::The action did not pass, so it is not fit to publish."
+            exit 1
+          fi
+          # An action that reports "passed" having asserted nothing would be
+          # worse than one that fails.
+          if [ "${PASSED:-0}" -lt 1 ]; then
+            echo "::error::The action reported no checks at all."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Tag and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [validate, test]
+    if: ${{ inputs.dry-run != true }}
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the version being published
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          tag="${RELEASE_TAG:-}"
+          if [ -z "$tag" ] && [ -n "$INPUT_VERSION" ]; then
+            tag="$INPUT_VERSION"
+            case "$tag" in v*) ;; *) tag="v${tag}" ;; esac
+          fi
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --json tagName --jq '.tagName' 2>/dev/null || echo '')
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::No version to publish. Create a release first, or pass one explicitly."
+            exit 1
+          fi
+
+          version="${tag#v}"
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'${version}' is not a semantic version."
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/${tag}" > /dev/null; then
+            echo "::error::Tag ${tag} does not exist. The Marketplace publishes from a tag, so create the release first (see release.yml)."
+            exit 1
+          fi
+
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "major=v${version%%.*}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Move the major version tag
+        # The convention every published action follows: consumers write
+        # `uses: owner/repo@v1` and get the newest v1.x.y without editing
+        # their workflow. A pre-release never moves it.
+        if: steps.version.outputs.prerelease == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          MAJOR: ${{ steps.version.outputs.major }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -f -a "$MAJOR" -m "TaskFlow action ${MAJOR}, currently ${TAG}" "refs/tags/${TAG}^{}"
+          git push --force origin "refs/tags/${MAJOR}"
+          echo "${MAJOR} now points at ${TAG}."
+
+      - name: Make sure a release exists for the tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ACTION_NAME: ${{ needs.validate.outputs.action-name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release ${TAG} already exists."
+          else
+            gh release create "$TAG" \
+              --title "${ACTION_NAME} ${TAG}" \
+              --generate-notes
+            echo "Created release ${TAG}."
+          fi
+
+      - name: How to finish the publish
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          MAJOR: ${{ steps.version.outputs.major }}
+          ACTION_NAME: ${{ needs.validate.outputs.action-name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### \`${ACTION_NAME}\` is ready to publish"
+            echo
+            echo "Validated, run end to end, tagged \`${TAG}\`, and \`${MAJOR}\` moved to match."
+            echo
+            echo "**One manual step remains, and only the first time.** GitHub exposes no API"
+            echo "for it:"
+            echo
+            echo "1. Open ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/edit/${TAG}"
+            echo "2. Tick **Publish this Action to the GitHub Marketplace**"
+            echo "3. Accept the terms, pick a category, then **Update release**"
+            echo
+            echo "After that it is listed, and every later release offers the same checkbox."
+            echo
+            echo "Consumers then write:"
+            echo
+            echo '```yaml'
+            echo "      - uses: ${GITHUB_REPOSITORY}@${MAJOR}"
+            echo "        with:"
+            echo "          base-url: http://localhost:8080"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  dry-run-report:
+    name: Dry run
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [validate, test]
+    if: ${{ inputs.dry-run == true }}
+    steps:
+      - name: Report
+        run: |
+          set -euo pipefail
+          {
+            echo "### Dry run"
+            echo
+            echo "action.yml validated and the action ran successfully."
+            echo "No tag was moved and no release was created."
+          } >> "$GITHUB_STEP_SUMMARY"
