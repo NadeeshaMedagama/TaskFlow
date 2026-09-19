@@ -1,0 +1,35 @@
+# Storage for Postgres.
+#
+# The direct translation of Compose's named volume:
+#
+#   volumes:                          ->   kind: PersistentVolumeClaim
+#     taskflow-db-data:                    (this file)
+#
+# The difference that matters: a Compose named volume is a directory on one
+# machine, created implicitly the moment something mounts it. A PVC is a
+# *request* -- "I need 2Gi that survives the pod" -- which the cluster's
+# StorageClass fulfils by provisioning a PersistentVolume. The pod does not
+# know or care what backs it, which is the whole point: the same manifest
+# works on kind's local-path provisioner, on an EBS volume, or on NFS.
+#
+# accessModes: ReadWriteOnce means "mountable read-write by one NODE at a
+# time". It is the reason 05-db.yaml must use `strategy: Recreate` -- see the
+# note there.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: taskflow-db-data
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-db
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: taskflow
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  # No storageClassName on purpose: leaving it unset uses the cluster's default
+  # StorageClass, which is `standard` on kind and minikube alike. Naming one
+  # here would make the manifest non-portable for no benefit.
