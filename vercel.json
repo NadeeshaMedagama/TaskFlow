@@ -1,0 +1,36 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+
+  "//": [
+    "Vercel is serverless, so this file plays the part nginx plays under Docker:",
+    "it decides what serves each path. web/index.html is served from the CDN and",
+    "everything the browser calls -- /api/* and /health -- is routed to the one",
+    "Node function in api/index.js, which is the Express app itself.",
+    "",
+    "`builds` is used rather than zero-config detection on purpose. Zero-config",
+    "turns every file in a root-level api/ directory into its own function, which",
+    "would also publish api/server.js at /api/server. Declaring the entrypoints",
+    "explicitly keeps the surface to exactly one function."
+  ],
+
+  "builds": [
+    {
+      "src": "api/index.js",
+      "use": "@vercel/node",
+      "config": {
+        "includeFiles": ["db/**"]
+      }
+    },
+    {
+      "src": "web/**",
+      "use": "@vercel/static"
+    }
+  ],
+
+  "routes": [
+    { "src": "/health", "dest": "/api/index.js" },
+    { "src": "/api/(.*)", "dest": "/api/index.js" },
+    { "src": "/", "dest": "/web/index.html" },
+    { "src": "/(.*)", "dest": "/web/$1" }
+  ]
+}
