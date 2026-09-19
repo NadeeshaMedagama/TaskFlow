@@ -1,0 +1,268 @@
+# Publish the two first-party TaskFlow images to Docker Hub.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#
+#   DOCKERHUB_USERNAME   your Docker Hub account name
+#   DOCKERHUB_TOKEN      a Docker Hub access token  (Docker Hub -> Account
+#                        settings -> Personal access tokens, scope
+#                        "Read & Write"). DOCKERHUB_PASSWORD is accepted as a
+#                        fallback if you prefer the account password, but an
+#                        access token is revocable on its own and is the
+#                        better choice.
+#
+# Optional repository variable:
+#
+#   DOCKERHUB_NAMESPACE  the namespace to publish under. Defaults to
+#                        DOCKERHUB_USERNAME. Setting it as a *variable* rather
+#                        than relying on the secret keeps the image name
+#                        readable in the logs -- a secret is masked as *** the
+#                        moment it is printed.
+#
+# There is no push trigger here on purpose: Docker Hub is the registry users
+# pull from, so it is published from tagged releases (release.yml calls this
+# workflow) or by hand, never from every commit. Continuous `edge` images go
+# to GitHub Packages instead -- see github-packages.yml.
+
+name: Publish Images To The Dockerhub
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. 1.0.0. Leave empty to derive it from the current tag.'
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: 'Target platforms.'
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
+      latest:
+        description: 'Also move the "latest" tag (stable semantic versions only).'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      version:
+        required: false
+        type: string
+        default: ''
+      platforms:
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
+      latest:
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      version:
+        description: 'The version string the images were tagged with.'
+        value: ${{ jobs.publish.outputs.version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: Check credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      namespace: ${{ steps.check.outputs.namespace }}
+    steps:
+      - name: Verify the Docker Hub secrets are present
+        id: check
+        # The `secrets` context cannot be read from a job-level or step-level
+        # `if:`, so the check has to happen inside a step, with the values
+        # arriving through `env`.
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          missing=""
+          if [ -z "$DOCKERHUB_USERNAME" ]; then
+            missing="${missing} DOCKERHUB_USERNAME"
+          fi
+          if [ -z "$DOCKERHUB_TOKEN" ] && [ -z "$DOCKERHUB_PASSWORD" ]; then
+            missing="${missing} DOCKERHUB_TOKEN (or DOCKERHUB_PASSWORD)"
+          fi
+
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):${missing}. Add them under Settings -> Secrets and variables -> Actions, then re-run this workflow."
+            exit 1
+          fi
+
+          namespace="${DOCKERHUB_NAMESPACE:-$DOCKERHUB_USERNAME}"
+          echo "namespace=${namespace}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "Credentials present (using DOCKERHUB_TOKEN)."
+          else
+            echo "::warning::Using DOCKERHUB_PASSWORD. A Docker Hub access token is revocable on its own and is preferred."
+          fi
+
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [preflight]
+    outputs:
+      # Both matrix legs compute the same value.
+      version: ${{ steps.meta.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: taskflow-api
+            context: api
+            description: 'TaskFlow REST API. Express on Node 22, Alpine base, runs as an unprivileged user.'
+          - image: taskflow-web
+            context: web
+            description: 'TaskFlow web tier. nginx serving the UI and reverse-proxying the API.'
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Work out tags and labels
+        id: meta
+        env:
+          NAMESPACE: ${{ needs.preflight.outputs.namespace }}
+          INPUT_VERSION: ${{ inputs.version }}
+          WANT_LATEST: ${{ inputs.latest }}
+          IMAGE_NAME: ${{ matrix.image }}
+          IMAGE_DESCRIPTION: ${{ matrix.description }}
+        run: |
+          set -euo pipefail
+          image="${NAMESPACE}/${IMAGE_NAME}"
+
+          version="$INPUT_VERSION"
+          if [ -z "$version" ]; then
+            case "$GITHUB_REF" in
+              refs/tags/v*) version="${GITHUB_REF#refs/tags/v}" ;;
+              *)
+                echo "::error::No version was given and ${GITHUB_REF} is not a v* tag. Re-run with an explicit version, e.g. 1.0.0."
+                exit 1
+                ;;
+            esac
+          fi
+
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'${version}' is not a semantic version (expected MAJOR.MINOR.PATCH, optionally -prerelease)."
+            exit 1
+          fi
+
+          tags=("${image}:${version}")
+          if echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            # Stable releases also move the major and major.minor tags, so a
+            # Pod spec can pin to 1.0 or 1 and still get patches. A
+            # pre-release moves neither, and never becomes "latest".
+            tags+=("${image}:${version%.*}" "${image}:${version%%.*}")
+            if [ "$WANT_LATEST" = "true" ]; then
+              tags+=("${image}:latest")
+            fi
+          fi
+
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "tags<<__TAGS__"
+            printf '%s\n' "${tags[@]}"
+            echo "__TAGS__"
+            echo "labels<<__LABELS__"
+            echo "org.opencontainers.image.title=${IMAGE_NAME}"
+            echo "org.opencontainers.image.description=${IMAGE_DESCRIPTION}"
+            echo "org.opencontainers.image.url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.revision=${GITHUB_SHA}"
+            echo "org.opencontainers.image.version=${version}"
+            echo "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "__LABELS__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Publishing as:"
+          printf '  %s\n' "${tags[@]}"
+
+      - name: Build and push ${{ matrix.image }}
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.context }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=hub-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=hub-${{ matrix.image }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Summarise
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Pushed \`${IMAGE}:${VERSION}\` to Docker Hub"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Repository | https://hub.docker.com/r/${IMAGE} |"
+            echo "| Platforms | \`${PLATFORMS}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo
+            echo '```bash'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify the published manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [preflight, publish]
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Inspect both manifests
+        env:
+          NAMESPACE: ${{ needs.preflight.outputs.namespace }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          set -euo pipefail
+          for name in taskflow-api taskflow-web; do
+            echo "::group::${NAMESPACE}/${name}:${VERSION}"
+            docker buildx imagetools inspect "${NAMESPACE}/${name}:${VERSION}"
+            echo "::endgroup::"
+          done

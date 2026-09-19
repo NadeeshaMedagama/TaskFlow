@@ -1,0 +1,72 @@
+# Local development conveniences, layered on top of docker-compose.yml.
+#
+# Compose loads `docker-compose.override.yml` AUTOMATICALLY when it sits next
+# to the base file, so plain `docker compose up` gets everything here. That is
+# the behaviour you want day to day, but it means you must be explicit when
+# you want to exercise the real thing:
+#
+#     docker compose up -d                        # base + this file (dev)
+#     docker compose -f docker-compose.yml up -d  # base only (prod-like)
+#
+# Nothing in here belongs anywhere near a real deployment: it bind-mounts
+# source code over the image's copy, publishes the datastores to the host,
+# and disables restart policies. That separation is the whole point of the
+# split -- the base file stays honest about how the stack really runs.
+#
+# Merge semantics worth knowing: scalars here replace the base value, maps
+# (environment, labels) are merged key by key, and sequences (ports, volumes)
+# are appended to the base list.
+
+services:
+  taskflow-db:
+    # Lets you point psql, DataGrip or pgAdmin on the host straight at the
+    # database. The base file deliberately publishes nothing.
+    ports:
+      - "5432:5432"
+    # A crash should stop and stay stopped while developing, so you actually
+    # see it, instead of being restarted into a loop that hides the error.
+    restart: "no"
+
+  taskflow-cache:
+    # Same idea: `redis-cli -h 127.0.0.1` from the host, or a GUI client.
+    ports:
+      - "6379:6379"
+    restart: "no"
+
+  taskflow-api:
+    # Live reload. `node --watch` is built in as of Node 18, so there is no
+    # nodemon dependency to add -- and nothing changes in the image, which
+    # stays exactly the artifact that would ship.
+    command: ["node", "--watch", "server.js"]
+    environment:
+      # Overrides the ENV NODE_ENV=production baked into the image. Merged
+      # on top of env_file, so the .env values still apply.
+      NODE_ENV: development
+    volumes:
+      # Mount the source over the image's copy so edits on the host are seen
+      # inside the container immediately.
+      - ./api:/app
+      # This anonymous volume is load-bearing, not decoration. The bind mount
+      # above replaces ALL of /app, including the /app/node_modules that
+      # `npm ci` produced during the build. Mounting a volume at that path
+      # shadows the bind mount there and keeps the image's dependencies --
+      # which matters because the host's node_modules may not exist at all,
+      # and if it does, native modules built for macOS/arm64 will not load on
+      # alpine/musl.
+      - /app/node_modules
+    # Reach the API directly, bypassing the nginx proxy, when you want to
+    # tell "the API is broken" apart from "the proxy is misrouting".
+    ports:
+      - "4000:4000"
+    restart: "no"
+
+  taskflow-web:
+    volumes:
+      # Edit the page and refresh -- nginx reads it from disk per request, so
+      # no rebuild is needed.
+      - ./web/index.html:/usr/share/nginx/html/index.html:ro
+      # Config changes are NOT picked up automatically; nginx reads this once
+      # at startup. After editing, reload it in place with:
+      #     docker compose exec taskflow-web nginx -s reload
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: "no"

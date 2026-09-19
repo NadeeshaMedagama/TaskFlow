@@ -1,0 +1,310 @@
+# Repository-root action metadata. GitHub requires this file to live at the
+# root of the repository for the repo to be listed on the Marketplace, which
+# is why it sits here rather than under .github/.
+#
+# It is deliberately self-contained: it shells out to nothing in this repo, so
+# it behaves identically whether it is consumed as `uses: ./` from inside
+# TaskFlow or as `uses: NadeeshaMedagama/TaskFlow@v1` from someone else's
+# workflow, where only *their* checkout is on disk.
+
+name: 'TaskFlow Stack Smoke Test'
+description: 'Start a Docker Compose stack, wait for every service to report healthy, and exercise the TaskFlow REST API end to end.'
+author: 'Nadeesha Medagama'
+
+# Shown on the Marketplace listing. `color` must be one of the eight values
+# GitHub accepts (white, yellow, blue, green, orange, red, purple, gray-dark)
+# and `icon` must be a Feather icon name -- anything else is rejected at
+# publish time, not at run time.
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  working-directory:
+    description: 'Directory containing the Compose files.'
+    required: false
+    default: '.'
+  compose-files:
+    description: 'Space-separated Compose files, listed in override order (later files win).'
+    required: false
+    default: 'docker-compose.yml'
+  env-file:
+    description: 'Env file Compose interpolates variables from.'
+    required: false
+    default: '.env'
+  env-template:
+    description: 'Copied to env-file when env-file is absent. Set to an empty string to disable.'
+    required: false
+    default: '.env.example'
+  services:
+    description: 'Space-separated Compose service names that must report healthy before the API is exercised.'
+    required: false
+    default: 'taskflow-db taskflow-cache taskflow-api taskflow-web'
+  base-url:
+    description: 'Origin the web tier is published on.'
+    required: false
+    default: 'http://localhost:8080'
+  timeout:
+    description: 'Seconds to wait for every service to become healthy.'
+    required: false
+    default: '180'
+  build:
+    description: 'Build images from the Compose build contexts before starting (true/false).'
+    required: false
+    default: 'true'
+  api-checks:
+    description: 'Run the TaskFlow REST API assertions -- health, list, create, cache invalidation (true/false).'
+    required: false
+    default: 'true'
+  teardown:
+    description: 'Run `docker compose down` when finished (true/false).'
+    required: false
+    default: 'true'
+  dump-logs-on-failure:
+    description: 'Print the last lines of every container log when a check fails (true/false).'
+    required: false
+    default: 'true'
+
+outputs:
+  result:
+    description: 'passed or failed.'
+    value: ${{ steps.checks.outputs.result }}
+  passed:
+    description: 'Number of checks that passed.'
+    value: ${{ steps.checks.outputs.passed }}
+  failed:
+    description: 'Number of checks that failed.'
+    value: ${{ steps.checks.outputs.failed }}
+  base-url:
+    description: 'The origin the checks were run against, echoed back for downstream steps.'
+    value: ${{ inputs.base-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Preflight
+      id: preflight
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COMPOSE_FILES: ${{ inputs.compose-files }}
+        ENV_FILE: ${{ inputs.env-file }}
+        ENV_TEMPLATE: ${{ inputs.env-template }}
+      run: |
+        set -euo pipefail
+
+        if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+          echo "::error::Docker daemon is not reachable on this runner."
+          exit 1
+        fi
+        if ! docker compose version >/dev/null 2>&1; then
+          echo "::error::Docker Compose v2 is not available (\`docker compose version\` failed)."
+          exit 1
+        fi
+
+        # Compose refuses to parse when a referenced env_file is missing, so
+        # seed it from the committed template rather than failing on a file
+        # that is gitignored by design.
+        if [[ -n "$ENV_FILE" && ! -f "$ENV_FILE" ]]; then
+          if [[ -n "$ENV_TEMPLATE" && -f "$ENV_TEMPLATE" ]]; then
+            cp "$ENV_TEMPLATE" "$ENV_FILE"
+            echo "Created $ENV_FILE from $ENV_TEMPLATE"
+          else
+            echo "::warning::$ENV_FILE is missing and no usable template was given; Compose may fail to parse."
+          fi
+        fi
+
+        for f in $COMPOSE_FILES; do
+          if [[ ! -f "$f" ]]; then
+            echo "::error::Compose file not found: $f (working-directory: $PWD)"
+            exit 1
+          fi
+        done
+
+        # Passed to every later step instead of re-deriving the flag list.
+        echo "TASKFLOW_COMPOSE_FILES=$COMPOSE_FILES" >> "$GITHUB_ENV"
+        echo "Compose files: $COMPOSE_FILES"
+
+    - name: Start the stack
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DO_BUILD: ${{ inputs.build }}
+      run: |
+        set -euo pipefail
+        read -r -a names <<< "$TASKFLOW_COMPOSE_FILES"
+        files=()
+        for f in "${names[@]}"; do files+=(-f "$f"); done
+
+        docker compose "${files[@]}" config --quiet
+        echo "Compose configuration is valid."
+
+        if [[ "$DO_BUILD" == "true" ]]; then
+          docker compose "${files[@]}" up -d --build
+        else
+          docker compose "${files[@]}" up -d
+        fi
+
+    - name: Wait for every service to report healthy
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SERVICES: ${{ inputs.services }}
+        WAIT_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+        read -r -a names <<< "$TASKFLOW_COMPOSE_FILES"
+        files=()
+        for f in "${names[@]}"; do files+=(-f "$f"); done
+
+        wait_healthy() {
+          local svc=$1 deadline=$((SECONDS + WAIT_TIMEOUT)) cid state
+          while (( SECONDS < deadline )); do
+            cid=$(docker compose "${files[@]}" ps -q "$svc" 2>/dev/null || true)
+            if [[ -n "$cid" ]]; then
+              # Services without a healthcheck have no .State.Health, so fall
+              # back to the plain container status for those.
+              state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || echo unknown)
+              case "$state" in
+                healthy|running) return 0 ;;
+                exited|dead)     return 1 ;;
+              esac
+            fi
+            sleep 2
+          done
+          return 1
+        }
+
+        failed=0
+        for svc in $SERVICES; do
+          if wait_healthy "$svc"; then
+            echo "  ok   $svc"
+          else
+            echo "::error::$svc never became healthy within ${WAIT_TIMEOUT}s"
+            failed=1
+          fi
+        done
+        exit "$failed"
+
+    - name: Exercise the API
+      id: checks
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE_URL: ${{ inputs.base-url }}
+        RUN_API_CHECKS: ${{ inputs.api-checks }}
+      run: |
+        set -uo pipefail
+
+        PASSED=0
+        FAILED=0
+        BODY=$(mktemp)
+        trap 'rm -f "$BODY"' EXIT
+
+        pass() { echo "  PASS  $1"; PASSED=$((PASSED + 1)); }
+        fail() { echo "::error::FAIL  $1"; FAILED=$((FAILED + 1)); }
+
+        http() {
+          local method=$1 url=$2 data=${3:-}
+          local args=(-sS -o "$BODY" -w '%{http_code}' -X "$method" --max-time 15)
+          [[ -n "$data" ]] && args+=(-H 'Content-Type: application/json' -d "$data")
+          curl "${args[@]}" "$url" 2>/dev/null || echo 000
+        }
+
+        if [[ "$RUN_API_CHECKS" == "true" ]]; then
+          echo "Running TaskFlow API checks against $BASE_URL"
+
+          code=$(http GET "$BASE_URL/health")
+          if [[ "$code" == 200 ]] && grep -q '"status":"ok"' "$BODY"; then
+            pass 'GET /health -> 200 {"status":"ok"}'
+          else
+            fail "GET /health -> $code $(head -c 160 "$BODY")"
+          fi
+
+          code=$(http GET "$BASE_URL/api/tasks")
+          if [[ "$code" == 200 ]] && grep -q '"tasks"' "$BODY"; then
+            pass 'GET /api/tasks -> 200 with a tasks array'
+          else
+            fail "GET /api/tasks -> $code $(head -c 160 "$BODY")"
+          fi
+
+          TITLE="smoke-$(date +%s)-$RANDOM"
+          code=$(http POST "$BASE_URL/api/tasks" "{\"title\":\"$TITLE\",\"description\":\"created by the TaskFlow smoke-test action\"}")
+          if [[ "$code" == 201 ]] && grep -q "\"title\":\"$TITLE\"" "$BODY"; then
+            pass 'POST /api/tasks -> 201, echoes the created task'
+          else
+            fail "POST /api/tasks -> $code $(head -c 160 "$BODY")"
+          fi
+
+          # The write deletes the cache key, so this read has to come from the
+          # database and has to contain the row that was just written.
+          code=$(http GET "$BASE_URL/api/tasks")
+          if [[ "$code" == 200 ]] && grep -q "\"title\":\"$TITLE\"" "$BODY"; then
+            pass 'GET /api/tasks -> the new task is present'
+          else
+            fail "GET /api/tasks -> the new task is missing (code $code)"
+          fi
+          if grep -q '"source":"db"' "$BODY"; then
+            pass 'the write invalidated the cache (source=db)'
+          else
+            fail "expected source=db after a write, got $(grep -o '"source":"[a-z]*"' "$BODY" || echo '?')"
+          fi
+
+          # That read repopulated the cache, so the next one must be served
+          # from Redis rather than Postgres.
+          http GET "$BASE_URL/api/tasks" >/dev/null
+          if grep -q '"source":"cache"' "$BODY"; then
+            pass 'repeat read served from Redis (source=cache)'
+          else
+            fail "expected source=cache on the repeat read, got $(grep -o '"source":"[a-z]*"' "$BODY" || echo '?')"
+          fi
+        else
+          echo "API checks disabled (api-checks: false); health was still verified above."
+        fi
+
+        RESULT=passed
+        if (( FAILED > 0 )); then RESULT=failed; fi
+
+        {
+          echo "passed=$PASSED"
+          echo "failed=$FAILED"
+          echo "result=$RESULT"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### TaskFlow smoke test: \`$RESULT\`"
+          echo
+          echo "| Checks passed | Checks failed | Base URL |"
+          echo "| --- | --- | --- |"
+          echo "| $PASSED | $FAILED | \`$BASE_URL\` |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if (( FAILED > 0 )); then
+          exit 1
+        fi
+        exit 0
+
+    - name: Container logs
+      if: failure() && inputs.dump-logs-on-failure == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -uo pipefail
+        read -r -a names <<< "${TASKFLOW_COMPOSE_FILES:-docker-compose.yml}"
+        files=()
+        for f in "${names[@]}"; do files+=(-f "$f"); done
+        docker compose "${files[@]}" ps --all || true
+        docker compose "${files[@]}" logs --no-color --tail=120 || true
+
+    - name: Tear down
+      if: always() && inputs.teardown == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -uo pipefail
+        read -r -a names <<< "${TASKFLOW_COMPOSE_FILES:-docker-compose.yml}"
+        files=()
+        for f in "${names[@]}"; do files+=(-f "$f"); done
+        # -v as well: a runner is disposable, and leaving the named volume
+        # behind would make a re-run on a warm runner skip the init.sql seed.
+        docker compose "${files[@]}" down --volumes --remove-orphans || true

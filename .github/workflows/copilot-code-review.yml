@@ -1,0 +1,156 @@
+# Request a GitHub Copilot code review on every pull request.
+#
+# Why pull_request_target rather than pull_request: a `pull_request` run
+# raised from a fork -- and from Dependabot -- gets a read-only GITHUB_TOKEN,
+# which cannot request a reviewer, so the step would fail on exactly the pull
+# requests that most want an automated review. `pull_request_target` runs with
+# the base repository's token instead.
+#
+# The usual danger of pull_request_target is that it runs with write
+# permissions against code from the pull request. That danger is avoided here
+# structurally: this workflow never checks the repository out. It only calls
+# the GitHub API, so no code from the pull request is ever executed.
+#
+# The job is written not to fail when Copilot code review is unavailable --
+# it is a per-plan feature, and a missing reviewer is a reason for a warning,
+# not a red pull request.
+
+name: Copilot Code Review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pull-request:
+        description: 'Pull request number to request a Copilot review on.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: copilot-review-${{ github.event.pull_request.number || inputs.pull-request }}
+  cancel-in-progress: true
+
+jobs:
+  request-review:
+    name: Request a review from Copilot
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Never ask a bot to review a bot's own throwaway branches other than
+    # Dependabot's, and never review a draft -- the ready_for_review event
+    # above covers the moment a draft becomes reviewable.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.draft == false
+    steps:
+      - name: Request the review
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pull-request }}
+        with:
+          # A repository secret named COPILOT_REVIEW_TOKEN (a fine-grained PAT
+          # with pull-request write access) is used when present. It is not
+          # required; the default job token works for pull requests raised in
+          # this repository.
+          github-token: ${{ secrets.COPILOT_REVIEW_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+
+            // Resolve the pull request: from the event payload normally, or
+            // from the dispatch input when run by hand.
+            let pr = context.payload.pull_request;
+            if (!pr) {
+              const number = Number(process.env.PR_NUMBER);
+              if (!Number.isInteger(number) || number <= 0) {
+                core.warning('No pull request number was supplied; nothing to do.');
+                return;
+              }
+              pr = (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
+            }
+
+            if (pr.draft) {
+              core.info(`#${pr.number} is a draft; Copilot will be asked when it is marked ready for review.`);
+              return;
+            }
+            if (pr.state !== 'open') {
+              core.info(`#${pr.number} is ${pr.state}; nothing to do.`);
+              return;
+            }
+
+            const isCopilot = (login) =>
+              typeof login === 'string' && login.replace(/\[bot\]$/, '') === 'copilot-pull-request-reviewer';
+
+            if ((pr.requested_reviewers || []).some((r) => isCopilot(r && r.login))) {
+              core.info(`Copilot has already been requested on #${pr.number}.`);
+              return;
+            }
+
+            // Copilot is a Bot actor, so it cannot be requested through the
+            // REST reviewers endpoint -- that one takes user and team slugs
+            // only. The GraphQL requestReviews mutation takes botIds, and the
+            // id has to be looked up first.
+            const lookup = `
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+                    nodes {
+                      login
+                      __typename
+                      ... on Bot { id }
+                      ... on User { id }
+                    }
+                  }
+                }
+              }`;
+
+            let copilot;
+            try {
+              const result = await github.graphql(lookup, { owner, repo });
+              const actors = result.repository.suggestedActors.nodes || [];
+              copilot = actors.find((a) => isCopilot(a && a.login));
+            } catch (error) {
+              core.warning(`Could not list the repository's suggested reviewers: ${error.message}`);
+              await core.summary
+                .addHeading('Copilot code review', 3)
+                .addRaw('The reviewer lookup failed, so no review was requested. This does not affect the pull request.')
+                .write();
+              return;
+            }
+
+            if (!copilot) {
+              const message =
+                'Copilot code review is not available to this repository, so no review was requested. ' +
+                'It needs a Copilot plan that includes code review, and Copilot enabled for the repository ' +
+                'under Settings -> Copilot. Everything else on this pull request is unaffected.';
+              core.warning(message);
+              await core.summary.addHeading('Copilot code review', 3).addRaw(message).write();
+              return;
+            }
+
+            const request = `
+              mutation($pullRequestId: ID!, $botId: ID!) {
+                requestReviews(input: { pullRequestId: $pullRequestId, botIds: [$botId], union: true }) {
+                  pullRequest { number }
+                }
+              }`;
+
+            try {
+              await github.graphql(request, { pullRequestId: pr.node_id, botId: copilot.id });
+              core.info(`Requested a Copilot review on #${pr.number}.`);
+              await core.summary
+                .addHeading('Copilot code review', 3)
+                .addRaw(`Requested on [#${pr.number}](${pr.html_url}).`)
+                .write();
+            } catch (error) {
+              // union: true means this is additive, so the most likely cause
+              // is a token without pull-request write access.
+              core.warning(`Could not request the Copilot review: ${error.message}`);
+              await core.summary
+                .addHeading('Copilot code review', 3)
+                .addRaw(`The request was rejected: ${error.message}`)
+                .write();
+            }

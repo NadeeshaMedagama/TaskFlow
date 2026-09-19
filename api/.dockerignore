@@ -1,0 +1,39 @@
+# Dependencies are installed inside the image by `npm ci` against the
+# lockfile. Copying the host's node_modules in would be slower, would ship
+# whatever happens to be on one developer's laptop, and would be actively
+# wrong: native modules compiled against macOS/arm64 do not run on
+# alpine/musl. It also defeats the reproducibility npm ci exists to give.
+node_modules
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Secrets. Configuration reaches the API as environment variables at run
+# time (compose `env_file`), so a .env must never be baked into a layer --
+# anyone who can pull the image can read its layers.
+.env
+.env.*
+
+# VCS, editor and OS noise
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+
+# Build inputs and docs that the running app has no use for
+Dockerfile
+.dockerignore
+*.md
+
+# init.sql belongs to Postgres, not to the API. Compose bind-mounts it
+# straight into the database container's /docker-entrypoint-initdb.d, so it
+# never needs to enter this image's build context.
+db/
+
+# Test and coverage artifacts, should any appear later
+coverage
+.nyc_output

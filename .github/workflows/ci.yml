@@ -1,0 +1,329 @@
+# CI/CD pipeline.
+#
+# CI  -- validate configuration, check the API, build both images, then run
+#        the whole stack and exercise it end to end.
+# CD  -- on a green push to `main`, publish continuous `edge` images to GitHub
+#        Packages (GHCR). Docker Hub is deliberately NOT published from here;
+#        that is release-only and lives in docker-publish.yml, so the tags a
+#        user pulls always correspond to a tagged release.
+#
+# Every publishing workflow is a reusable workflow, so this file orchestrates
+# them with `uses:` rather than duplicating the build.
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    # Documentation-only pushes do not need the stack built. This filter is
+    # deliberately absent from `pull_request` below: filtering there would
+    # leave a required status check permanently pending on a docs-only PR.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+# A second push to the same branch supersedes the first. In-progress runs are
+# cancelled for pull requests only -- a run on main may already be publishing.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Seed .env from the committed template
+        # .env is gitignored by design, and Compose refuses to parse a file
+        # whose env_file is missing, so every job that touches Compose needs
+        # this first.
+        run: cp .env.example .env
+
+      - name: Validate the base Compose file
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Validate the base file plus the development overlay
+        run: docker compose -f docker-compose.yml -f docker-compose.override.yml config --quiet
+
+      - name: Assert no datastore is published in the base file
+        # The base file is the prod-like one: only the web tier may bind a
+        # host port. A stray `ports:` on the database would be a real leak,
+        # so it is asserted rather than left to review.
+        run: |
+          set -euo pipefail
+          published=$(docker compose -f docker-compose.yml config --format json \
+            | jq -r '.services | to_entries[] | .key as $svc | (.value.ports // [])[] | "\($svc):\(.published)"')
+          echo "Services publishing a host port:"
+          echo "${published:-  (none)}"
+          unexpected=$(echo "$published" | grep -v '^taskflow-web:' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::Only taskflow-web may publish a host port in docker-compose.yml. Found: ${unexpected}"
+            exit 1
+          fi
+
+      - name: Lint the shell scripts
+        # Both scripts are clean at this level today, so it is a real gate
+        # rather than an advisory one. SC2034 is excluded because the colour
+        # palette in each script is defined as a complete set on purpose, and
+        # the one or two unused members of it are not a defect.
+        run: shellcheck --severity=warning --exclude=SC2034 scripts/*.sh
+
+      - name: Lint the Dockerfiles
+        run: |
+          set -euo pipefail
+          for dockerfile in api/Dockerfile api/Dockerfile.debian web/Dockerfile; do
+            echo "::group::hadolint ${dockerfile}"
+            docker run --rm -i hadolint/hadolint:latest \
+              hadolint --failure-threshold error - < "$dockerfile"
+            echo "::endgroup::"
+          done
+
+      - name: Lint the workflow files
+        # actionlint parses every workflow, type-checks the expressions and
+        # runs shellcheck over each `run:` block.
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}:/repo" --workdir /repo \
+            rhysd/actionlint:latest -color
+
+  # ---------------------------------------------------------------------------
+  api:
+    name: API checks (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is what the image ships; 20 is the previous LTS, kept so a
+        # dependency that quietly drops it is caught here rather than later.
+        node: ['20', '22']
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+          cache-dependency-path: api/package-lock.json
+
+      - name: Install dependencies from the lockfile
+        working-directory: api
+        # npm ci fails loudly if package.json and the lockfile have drifted,
+        # which is exactly the check wanted in CI.
+        run: npm ci
+
+      - name: Syntax-check the server
+        working-directory: api
+        run: node --check server.js
+
+      - name: Start the API and assert /health
+        working-directory: api
+        # /health answers without touching Postgres or Redis, so this proves
+        # the process boots and serves without needing the datastores. The
+        # Redis client's connect failure is caught by server.js, so the
+        # process is expected to stay up.
+        env:
+          PORT: '4099'
+        run: |
+          set -euo pipefail
+          node server.js > /tmp/api.log 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${PORT}/health" 2>/dev/null | grep -q '"status":"ok"'; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::The API did not answer GET /health within 30s"
+            cat /tmp/api.log
+            exit 1
+          fi
+          echo "GET /health answered 200 {\"status\":\"ok\"}"
+
+      - name: Audit production dependencies
+        # Advisory: a brand-new advisory against a transitive dependency
+        # should surface here, not block an unrelated pull request. The
+        # blocking security gates are CodeQL and the image scan.
+        if: matrix.node == '22'
+        continue-on-error: true
+        working-directory: api
+        run: npm audit --omit=dev --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  images:
+    name: Build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: taskflow-api
+            context: api
+            expect-non-root: 'true'
+          - image: taskflow-web
+            context: web
+            # nginx's master process starts as root on purpose so it can bind
+            # :80 and drop to the `nginx` user for its workers.
+            expect-non-root: 'false'
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.context }}
+          push: false
+          load: true
+          tags: taskflow/${{ matrix.image }}:ci
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      - name: Inspect the built image
+        env:
+          IMAGE: taskflow/${{ matrix.image }}:ci
+          EXPECT_NON_ROOT: ${{ matrix.expect-non-root }}
+        run: |
+          set -euo pipefail
+          size=$(docker image inspect "$IMAGE" --format '{{.Size}}')
+          size_mb=$(( size / 1024 / 1024 ))
+          user=$(docker image inspect "$IMAGE" --format '{{.Config.User}}')
+          echo "size: ${size_mb} MB   configured user: ${user:-root}"
+
+          if [ "$EXPECT_NON_ROOT" = "true" ]; then
+            uid=$(docker run --rm --entrypoint id "$IMAGE" -u)
+            echo "runtime uid: $uid"
+            if [ "$uid" = "0" ]; then
+              echo "::error::${IMAGE} runs as root; it is built to run as the unprivileged node user."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "### ${IMAGE}"
+            echo
+            echo "| Size | Configured user |"
+            echo "| --- | --- |"
+            echo "| ${size_mb} MB | \`${user:-root}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scan the image for known vulnerabilities
+        # Advisory for the same reason as npm audit: a new CVE in the base
+        # image is information, not a reason to block an unrelated change.
+        continue-on-error: true
+        env:
+          IMAGE: taskflow/${{ matrix.image }}:ci
+        run: |
+          set -uo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${HOME}/.cache/trivy:/root/.cache/trivy" \
+            aquasec/trivy:latest image \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --no-progress \
+              "$IMAGE"
+
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Integration smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [validate]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Run the TaskFlow stack smoke test
+        id: smoke
+        # This is the repository's own composite action (./action.yml), the
+        # one published to the Marketplace. Using it here means the published
+        # action is exercised by every single pull request.
+        uses: ./
+        with:
+          compose-files: 'docker-compose.yml'
+          base-url: 'http://localhost:8080'
+          timeout: '180'
+          build: 'true'
+          teardown: 'true'
+
+      - name: Report the result
+        if: always()
+        env:
+          RESULT: ${{ steps.smoke.outputs.result }}
+          PASSED: ${{ steps.smoke.outputs.passed }}
+          FAILED: ${{ steps.smoke.outputs.failed }}
+        run: |
+          echo "smoke test ${RESULT:-unknown}: ${PASSED:-0} passed, ${FAILED:-0} failed"
+
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI result
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [validate, api, images, integration]
+    steps:
+      - name: Summarise
+        env:
+          RESULTS: ${{ join(needs.*.result, ', ') }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### CI result"
+            echo
+            echo "- validate: ${{ needs.validate.result }}"
+            echo "- api: ${{ needs.api.result }}"
+            echo "- images: ${{ needs.images.result }}"
+            echo "- integration: ${{ needs.integration.result }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "job results: ${RESULTS}"
+
+      - name: Fail if any upstream job did not succeed
+        # This is the single job worth marking as a required status check:
+        # it collapses the whole matrix into one green or red result.
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+
+  # ---------------------------------------------------------------------------
+  # CD -- continuous images, main only, only once CI is green.
+  publish-edge:
+    name: Publish edge images to GitHub Packages
+    needs: [ci]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/github-packages.yml
+    with:
+      version: 'edge'
+      platforms: 'linux/amd64'
+    secrets: inherit
