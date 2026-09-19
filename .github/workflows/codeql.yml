@@ -1,0 +1,94 @@
+# CodeQL static analysis.
+#
+# Two languages are scanned:
+#   javascript-typescript  the Express API and the browser code in web/
+#   actions                the workflow files themselves -- CodeQL's Actions
+#                          pack catches expression injection, unpinned
+#                          third-party actions and over-broad permissions
+#
+# Neither needs a build: both are interpreted, so build-mode is `none` and the
+# analysis runs straight over the checkout.
+#
+# One setup note. GitHub offers CodeQL in two modes and they are mutually
+# exclusive: if "Default setup" is switched on under Settings -> Code security
+# -> Code scanning, this workflow will fail with "CodeQL analyses from
+# advanced configurations cannot be processed when the default setup is
+# enabled". Leave code scanning off, or set it to Advanced, and this file is
+# the configuration.
+
+name: CodeQL Security Analysis
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Weekly, so a newly published query finds old code too. Off the hour to
+    # avoid the crowd of jobs everyone schedules on it.
+    - cron: '27 3 * * 1'
+  workflow_dispatch:
+
+# Nothing is granted at the top level; each job asks for exactly what it uses.
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Required to upload the SARIF results to the Security tab.
+      security-events: write
+      # Required by the CodeQL action to read the workflow run's own metadata.
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+            # security-extended adds the lower-precision security queries on
+            # top of the default suite. Worth it on a codebase this size,
+            # where the extra findings are still a short list.
+            queries: security-extended
+          - language: actions
+            build-mode: none
+            # The Actions pack's default suite only. Its whole query set is
+            # security-focused already, so there is nothing to extend.
+            queries: ''
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: ${{ matrix.queries }}
+
+      - name: Run the analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
+
+  # A single job to make a required status check point at, so that adding or
+  # removing a language from the matrix above does not orphan the rule.
+  codeql:
+    name: CodeQL result
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [analyze]
+    steps:
+      - name: Fail if any analysis did not succeed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - name: Report
+        run: echo "CodeQL analysis completed for every configured language."
