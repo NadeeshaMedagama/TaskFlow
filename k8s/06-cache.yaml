@@ -1,0 +1,147 @@
+# ---------------------------------------------------------------------------
+# taskflow-cache  --  Redis
+#
+# The one service with no PersistentVolumeClaim, and that is a statement, not
+# an omission: this is a pure cache with a 30-second TTL. Everything in it can
+# be rebuilt from Postgres, so it gets no storage and losing the pod costs
+# nothing but a few slow requests.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-cache
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-cache
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: taskflow
+    app.kubernetes.io/version: "7"
+spec:
+  # One replica. Redis does not replicate by being scaled -- two independent
+  # pods behind one Service would be two different caches, and which one you
+  # hit would depend on load balancing, so a write invalidating one would
+  # leave the other stale. Scaling Redis means Sentinel or Cluster, which is
+  # out of scope here.
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-cache
+      app.kubernetes.io/instance: taskflow
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taskflow-cache
+        app.kubernetes.io/instance: taskflow
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/part-of: taskflow
+        app.kubernetes.io/version: "7"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          # `args`, not `command`. args replaces the image's CMD
+          # (`redis-server`) while leaving its ENTRYPOINT
+          # (docker-entrypoint.sh) in place -- and that entrypoint is what
+          # drops privileges from root to the redis user. Using `command`
+          # would bypass it and run the server as root.
+          #
+          # Both flags exist because of the memory limit below, and neither
+          # should be removed without removing that limit too:
+          #
+          #   --maxmemory 192mb  Redis does not read its cgroup limit. Left at
+          #     the default of 0 ("unlimited") it grows until it hits the 256Mi
+          #     limit and the kernel OOM-kills the container, which Kubernetes
+          #     reports as a mystifying exit code 137. Capping it below the
+          #     container limit makes Redis evict instead -- which is what a
+          #     cache is supposed to do when it is full.
+          #   --save ""  disables RDB snapshots. Nothing here is worth
+          #     persisting, and a background save forks the process: a memory
+          #     spike that a hard limit turns into a kill.
+          args:
+            - redis-server
+            - --maxmemory
+            - 192mb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --save
+            - ""
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          startupProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 20
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 5
+          # From docker-compose.yml, unchanged.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              # Drop everything, then add back ONLY what this image's entrypoint
+              # genuinely needs. Dropping ALL on its own does not work here:
+              # the official image starts as root, fixes ownership, and then
+              # drops to its own unprivileged user -- and every one of those
+              # steps is a capability.
+              #
+              #   CHOWN         chown the data directory
+              #   DAC_OVERRIDE  write into directories it does not own
+              #   FOWNER        chmod files owned by another user
+              #   SETUID/SETGID setpriv drops root to redis
+              #
+              # Without them the container exits immediately with
+              # "Operation not permitted" -- which is exactly what happens if
+              # you delete any line below.
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-cache
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-cache
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: taskflow
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: taskflow-cache
+    app.kubernetes.io/instance: taskflow
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
