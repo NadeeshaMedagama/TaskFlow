@@ -77,8 +77,8 @@ jobs:
     timeout-minutes: 10
     outputs:
       version: ${{ steps.plan.outputs.version }}
-      api-image: ${{ steps.plan.outputs.api-image }}
-      web-image: ${{ steps.plan.outputs.web-image }}
+      api_image: ${{ steps.plan.outputs.api_image }}
+      web_image: ${{ steps.plan.outputs.web_image }}
       namespace: ${{ steps.plan.outputs.namespace }}
       registry: ${{ steps.plan.outputs.registry }}
     steps:
@@ -121,8 +121,8 @@ jobs:
             echo "version=${version}"
             echo "registry=${registry}"
             echo "namespace=${namespace}"
-            echo "api-image=${namespace}/taskflow-api:${version}"
-            echo "web-image=${namespace}/taskflow-web:${version}"
+            echo "api_image=${namespace}/taskflow-api:${version}"
+            echo "web_image=${namespace}/taskflow-web:${version}"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -169,8 +169,8 @@ jobs:
         # A deploy that points at a tag nobody published would fail on the
         # host instead, long after the approval. Catch it here.
         env:
-          API_IMAGE: ${{ needs.plan.outputs.api-image }}
-          WEB_IMAGE: ${{ needs.plan.outputs.web-image }}
+          API_IMAGE: ${{ needs.plan.outputs.api_image }}
+          WEB_IMAGE: ${{ needs.plan.outputs.web_image }}
         run: |
           set -euo pipefail
           missing=0
@@ -242,8 +242,8 @@ jobs:
       - name: Deploy
         env:
           VERSION: ${{ needs.plan.outputs.version }}
-          API_IMAGE: ${{ needs.plan.outputs.api-image }}
-          WEB_IMAGE: ${{ needs.plan.outputs.web-image }}
+          API_IMAGE: ${{ needs.plan.outputs.api_image }}
+          WEB_IMAGE: ${{ needs.plan.outputs.web_image }}
         run: |
           set -euo pipefail
 
