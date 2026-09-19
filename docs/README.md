@@ -8,7 +8,8 @@ application.
 | `TaskFlow_Docker_Mentoring_Task.pdf` | The original brief — Phase 1 of the Cloud-Native Engineering Mentoring Track |
 | `TaskFlow_Phase1_Docker_Submission_Report.docx` | **The submission.** 18 pages: measured image sizes, the Part 5 defect analysis, verification evidence and the reflection answers |
 | `debugging-exercise/` | The broken compose file from Part 5, kept so the fixes can be walked through side by side |
-| `evidence/` | The 14 screenshots referenced as Figures 2–16 in the report |
+| `evidence/` | The 23 screenshots referenced as Figures 2–25 in the report — `01`–`14` Docker, `15`–`23` Kubernetes |
+| `DEPLOY-VERCEL.md` | Step-by-step deployment of the same application to Vercel (serverless + managed Postgres), alongside the Docker stack rather than instead of it |
 
 ## Start here
 
