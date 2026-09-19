@@ -1,0 +1,156 @@
+# Auto-merge Dependabot pull requests.
+#
+# Policy (chosen deliberately, see the steps below):
+#   patch, minor  -> approved and queued for auto-merge
+#   major         -> labelled and commented on, left for a human
+#
+# "Queued for auto-merge" is the important part: `gh pr merge --auto` does not
+# merge anything, it asks GitHub to merge the pull request *once the required
+# status checks pass*. Nothing is merged without CI going green first.
+#
+# Two repository settings are required, both one-time:
+#
+#   1. Settings -> General -> Pull Requests -> "Allow auto-merge"
+#   2. A branch protection rule (or ruleset) on `main` that requires the
+#      "CI result" check from ci.yml. Without a required check there is
+#      nothing for auto-merge to wait on and GitHub merges immediately.
+#
+# On triggers: a pull request raised by Dependabot gets a read-only
+# GITHUB_TOKEN by default, which is why the `permissions:` block below is not
+# optional -- it is what restores the write access needed to approve and
+# merge. Dependabot's own secrets are still unavailable here, and nothing in
+# this file needs them.
+
+name: Dependabot Auto Merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    name: Triage and merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Both checks matter: `actor` is who triggered the run and `user.login` is
+    # who opened the pull request. Requiring both means a rerun triggered by
+    # somebody else on a spoofed branch name still cannot reach these steps.
+    if: >-
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Read the Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show what is being proposed
+        env:
+          NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          PREVIOUS: ${{ steps.metadata.outputs.previous-version }}
+          NEW: ${{ steps.metadata.outputs.new-version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Dependabot update"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Dependencies | \`${NAMES}\` |"
+            echo "| Ecosystem | \`${ECOSYSTEM}\` |"
+            echo "| Update type | \`${UPDATE_TYPE}\` |"
+            echo "| Version | \`${PREVIOUS:-?}\` -> \`${NEW:-?}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Approve patch and minor updates
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Re-approving an already-approved pull request is an error, not a
+          # no-op, and `synchronize` fires this workflow again on every force
+          # push Dependabot makes -- so an existing approval is treated as
+          # success rather than as a failure.
+          if gh pr review --approve "$PR_URL" \
+              --body "Approved automatically: ${UPDATE_TYPE} update, per .github/workflows/dependabot-auto-merge.yml."; then
+            echo "Approved."
+          else
+            echo "::notice::Already approved, or approval was rejected; continuing to the merge step."
+          fi
+
+      - name: Queue patch and minor updates for auto-merge
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if gh pr merge --auto --squash "$PR_URL"; then
+            echo "Auto-merge enabled; GitHub will merge this once the required checks pass."
+            echo "Auto-merge enabled -- this merges itself once CI is green." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # The usual cause is the repository setting rather than anything
+          # wrong with the pull request, so this is reported as a warning with
+          # the fix rather than as a failed run.
+          echo "::warning::Could not enable auto-merge. Check Settings -> General -> Pull Requests -> 'Allow auto-merge' is ticked, and that a ruleset on the base branch requires a status check."
+          {
+            echo
+            echo "**Auto-merge was not enabled.** Most likely one of:"
+            echo
+            echo "- \`Settings -> General -> Pull Requests -> Allow auto-merge\` is off."
+            echo "- The base branch has no required status check for auto-merge to wait on."
+            echo "- The pull request already has a merge conflict."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Flag major updates for a human
+        # Only on `opened`, so a force push from Dependabot does not add the
+        # same comment again on every synchronize.
+        if: >-
+          github.event.action == 'opened' &&
+          steps.metadata.outputs.update-type == 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          PREVIOUS: ${{ steps.metadata.outputs.previous-version }}
+          NEW: ${{ steps.metadata.outputs.new-version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          # Creating a label that already exists is an error; both calls are
+          # tolerant because neither is worth failing the run over.
+          gh label create "major-update" \
+            --color "B60205" \
+            --description "A major version bump -- read it before merging" \
+            --force || true
+          gh pr edit "$PR_URL" --add-label "major-update" || true
+
+          gh pr comment "$PR_URL" --body "$(cat <<COMMENT
+          This is a **major** version bump (\`${NAMES}\`: \`${PREVIOUS:-?}\` -> \`${NEW:-?}\`), so it was not auto-merged.
+
+          Major versions are allowed to break their API. Before merging, check the upstream changelog and confirm nothing in \`api/server.js\` or the Dockerfiles depends on what changed.
+          COMMENT
+          )" || true
+
+          echo "Major update flagged for manual review." >> "$GITHUB_STEP_SUMMARY"
