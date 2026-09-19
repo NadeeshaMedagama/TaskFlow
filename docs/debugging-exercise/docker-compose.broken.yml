@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+
+  taskflow-db:
+    image: postgres:latest
+
+    environment:
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: taskflow
+
+    ports:
+      - "5432:5432"
+
+  taskflow-cache:
+   image: redis:7-alpine
+
+  taskflow-api:
+    build: ./api
+
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: taskflow
+      DB_PASSWORD: changeme
+      DB_NAME: taskflow
+      REDIS_HOST: taskflow-cache
+
+    ports:
+      - "4000:4000"
+
+    depends_on:
+      - taskflow-db
+
+  taskflow-web:
+    build: ./web
+
+    ports:
+      - "80:8080"
+    depends_on:
+      - taskflow-api
+
+# line 15: mapping key "environment" already defined at line 5
+# In YAML, services and their properties must be properly indented.
+# correct the indented issues
+# the attribute `version` is obsolete, it will be ignored
+# DB configurations added to the compose file, that is security information leaked issue
+# DB_PASSWORD should be stored in a .env file and not in the compose file
+# DB_PASSWROD need to change into the DB_PASSWORD
+# API ports need to change '4000:4000'
+# DB_HOST change to the correct service name 'taskflow-db' from exiting service name 'postgres'
