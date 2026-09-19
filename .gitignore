@@ -49,6 +49,9 @@ bin/
 ### Office lock files ###
 ~$*
 
+### Generated submission documents ###
+docs/TaskFlow_Phase1_Docker_Submission_Report.docx
+
 ### Local scratch ###
 push-images.sh
 
