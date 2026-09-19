@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# Horizontal scaling -- the third thing Compose cannot do.
+#
+# OPTIONAL. This needs metrics-server, which is not installed by default on
+# kind. Applying it without metrics-server is harmless: the HPA simply reports
+# `<unknown>/70%` in `kubectl get hpa` and never scales. See the README.
+#
+# BEFORE YOU USE THIS: delete `replicas: 2` from the Deployment in 07-api.yaml.
+# Both this and that field write .spec.replicas, so leaving both in place means
+# every `kubectl apply` stomps whatever the HPA decided, and the HPA then
+# scales back up. The convention is that once an HPA owns a Deployment, the
+# Deployment stops declaring a replica count.
+# ---------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: taskflow-api
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-api
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: taskflow
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: taskflow-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          # Percentage of the pod's resources.requests.cpu -- 70% of the 100m
+          # requested in 07-api.yaml, so 70m. This is why requests are not
+          # optional decoration: an HPA with no request to measure against has
+          # nothing to compute a ratio from and will not function.
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      # React quickly to load, but not to a single spiky sample.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Come down slowly. Five minutes of sustained quiet before shrinking,
+      # so a brief lull between bursts does not cause a scale-down that is
+      # immediately undone -- the classic HPA flapping problem.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
