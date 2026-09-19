@@ -109,9 +109,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 22 is what the image ships; 20 is the previous LTS, kept so a
-        # dependency that quietly drops it is caught here rather than later.
-        node: ['20', '22']
+        # 22 is what everything actually runs: the node:22-alpine base image,
+        # api/package.json's engines field, and therefore the Vercel function
+        # too. 24 is the forward canary -- it is what a widened engines range
+        # would select, so a dependency that breaks on it is caught here.
+        node: ['22', '24']
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
