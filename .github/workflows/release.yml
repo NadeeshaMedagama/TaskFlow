@@ -1,0 +1,346 @@
+# Release workflow.
+#
+# Two ways in, one path out:
+#
+#   git tag v1.1.0 && git push origin v1.1.0     -> releases 1.1.0
+#   Actions -> Release -> Run workflow, v1.1.0   -> creates the tag, then the
+#                                                   same path
+#
+# Order matters and is enforced by `needs:`. The stack is proved to work
+# before anything is published, and the images are published before the
+# GitHub release is created, so a release never points at a tag that does not
+# exist in a registry.
+#
+#   prepare -> verify -> tag -> publish (Docker Hub + GHCR) -> release
+#
+# Publishing is delegated to docker-publish.yml and github-packages.yml as
+# reusable workflows rather than duplicated here.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, with or without the leading v (e.g. 1.1.0 or v1.1.0).'
+        required: true
+        type: string
+      draft:
+        description: 'Create the GitHub release as a draft.'
+        required: false
+        type: boolean
+        default: false
+      publish-images:
+        description: 'Publish images to Docker Hub and GitHub Packages.'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Resolve the version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish-images }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="$INPUT_VERSION"
+            case "$tag" in v*) ;; *) tag="v${tag}" ;; esac
+          fi
+          version="${tag#v}"
+
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'${version}' is not a semantic version (expected MAJOR.MINOR.PATCH, optionally -prerelease)."
+            exit 1
+          fi
+
+          # A dispatched release must not silently reuse an existing tag.
+          if [ "$GITHUB_EVENT_NAME" != "push" ] && git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::Tag ${tag} already exists. Pick a new version, or delete the tag first."
+            exit 1
+          fi
+
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+
+          publish=true
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_PUBLISH" != "true" ]; then
+            publish=false
+          fi
+
+          # Advisory only: the default in .env.example is what someone running
+          # the stack by hand gets, so it is worth keeping in step.
+          declared=$(sed -n 's/^TASKFLOW_VERSION=//p' .env.example | tail -n1 || true)
+          if [ -n "$declared" ] && [ "$declared" != "$version" ]; then
+            echo "::warning::.env.example still declares TASKFLOW_VERSION=${declared}, but this release is ${version}."
+          fi
+
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "prerelease=${prerelease}"
+            echo "publish=${publish}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Releasing \`${tag}\`"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`${version}\` |"
+            echo "| Pre-release | \`${prerelease}\` |"
+            echo "| Publish images | \`${publish}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify the stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [prepare]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Run the TaskFlow stack smoke test
+        uses: ./
+        with:
+          compose-files: 'docker-compose.yml'
+          build: 'true'
+          teardown: 'true'
+
+  # ---------------------------------------------------------------------------
+  tag:
+    name: Create the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [prepare, verify]
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag and push
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # An annotated tag, so `git describe` and the release page both have
+          # a message and a tagger to show.
+          git tag -a "$TAG" -m "TaskFlow ${VERSION}"
+          git push origin "$TAG"
+          echo "Pushed ${TAG}."
+
+  # ---------------------------------------------------------------------------
+  publish-dockerhub:
+    name: Publish to Docker Hub
+    needs: [prepare, verify, tag]
+    # `tag` is skipped on a tag push, and a skipped dependency would normally
+    # skip this job too, so its result is allowed to be either.
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.verify.result == 'success' &&
+      needs.tag.result != 'failure' &&
+      needs.prepare.outputs.publish == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      platforms: 'linux/amd64,linux/arm64'
+      latest: ${{ needs.prepare.outputs.prerelease != 'true' }}
+    secrets: inherit
+
+  publish-ghcr:
+    name: Publish to GitHub Packages
+    needs: [prepare, verify, tag]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.verify.result == 'success' &&
+      needs.tag.result != 'failure' &&
+      needs.prepare.outputs.publish == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/github-packages.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      platforms: 'linux/amd64,linux/arm64'
+      latest: ${{ needs.prepare.outputs.prerelease != 'true' }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create the GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [prepare, verify, tag, publish-dockerhub, publish-ghcr]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.verify.result == 'success' &&
+      needs.tag.result != 'failure' &&
+      needs.publish-dockerhub.result != 'failure' &&
+      needs.publish-ghcr.result != 'failure'
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # The tag job may have pushed the tag after this workflow started.
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Build the deployment bundle
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          bundle="taskflow-${VERSION}-deploy"
+          GHCR_OWNER="ghcr.io/$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
+          export GHCR_OWNER
+          mkdir -p "dist/${bundle}"
+
+          cp docker-compose.yml .env.example README.md "dist/${bundle}/"
+          mkdir -p "dist/${bundle}/scripts"
+          cp scripts/smoke-test.sh "dist/${bundle}/scripts/"
+
+          cat > "dist/${bundle}/DEPLOY.md" <<NOTE
+          # TaskFlow ${VERSION} -- deployment bundle
+
+          Everything needed to run this release without cloning the repository.
+
+              cp .env.example .env      # then set DB_PASSWORD to something real
+              docker compose pull
+              docker compose up -d
+              ./scripts/smoke-test.sh --no-build
+
+          Images published for this release:
+
+              docker pull ${GHCR_OWNER}/taskflow-api:${VERSION}
+              docker pull ${GHCR_OWNER}/taskflow-web:${VERSION}
+
+          The same two tags were pushed to Docker Hub under the namespace this
+          repository is configured to publish to. Set REGISTRY_NAMESPACE in
+          .env to whichever of the two you want to pull from; docker-compose.yml
+          builds the image names out of it.
+          NOTE
+
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          echo "Bundle: dist/${bundle}.tar.gz"
+          ls -lh "dist/${bundle}.tar.gz"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          DRAFT: ${{ inputs.draft }}
+          PUBLISHED: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -euo pipefail
+
+          images_section="Images were not published for this release."
+          if [ "$PUBLISHED" = "true" ]; then
+            images_section=$(cat <<IMAGES
+          ### Images
+
+          \`\`\`bash
+          docker pull ghcr.io/$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')/taskflow-api:${VERSION}
+          docker pull ghcr.io/$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')/taskflow-web:${VERSION}
+          \`\`\`
+
+          The same tags were pushed to Docker Hub under the configured namespace.
+          IMAGES
+          )
+          fi
+
+          notes=$(cat <<NOTES
+          ## TaskFlow ${VERSION}
+
+          The full stack was brought up and exercised end to end before this release was cut.
+
+          ${images_section}
+
+          ### Quick start
+
+          \`\`\`bash
+          curl -fsSLO ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}/taskflow-${VERSION}-deploy.tar.gz
+          tar -xzf taskflow-${VERSION}-deploy.tar.gz && cd taskflow-${VERSION}-deploy
+          cp .env.example .env && docker compose up -d
+          \`\`\`
+          NOTES
+          )
+
+          args=(--title "TaskFlow ${VERSION}" --notes "$notes")
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          if [ "$DRAFT" = "true" ]; then args+=(--draft); fi
+
+          bundle="dist/taskflow-${VERSION}-deploy.tar.gz"
+
+          # --generate-notes asks GitHub to append the merged-pull-request
+          # changelog to the body above. If this build of gh ever refuses the
+          # combination, the release is still created with the body alone.
+          if ! gh release create "$TAG" "${args[@]}" --generate-notes "$bundle"; then
+            echo "::warning::Falling back to a release without auto-generated notes."
+            gh release create "$TAG" "${args[@]}" "$bundle"
+          fi
+
+          echo "Created ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          {
+            echo "### Release created"
+            echo
+            echo "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Next step
+        run: |
+          set -euo pipefail
+          {
+            echo
+            echo "Deploying is a separate, gated step: run the **Deploy Production** workflow"
+            echo "and give it this version. It waits for an approval on the \`production\`"
+            echo "environment before it touches anything."
+          } >> "$GITHUB_STEP_SUMMARY"
