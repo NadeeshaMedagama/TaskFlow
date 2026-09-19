@@ -1,0 +1,114 @@
+# Dependabot version updates.
+#
+# Four ecosystems are watched, because TaskFlow pins versions in four
+# different places and a bump in any one of them can break the stack:
+#
+#   npm            -> api/package.json + api/package-lock.json
+#   docker (api)   -> the node:22-alpine base image
+#   docker (web)   -> the nginx:1.27-alpine base image
+#   docker (root)  -> the postgres/redis images pinned in docker-compose.yml
+#   github-actions -> every `uses:` in .github/workflows and action.yml
+#
+# Patch and minor updates are grouped so they arrive as one reviewable pull
+# request per ecosystem instead of one per package; major updates are left
+# ungrouped on purpose, because each one deserves to be read on its own.
+# Pull requests opened from here are handled by dependabot-auto-merge.yml.
+
+version: 2
+
+updates:
+  # --- Application dependencies -------------------------------------------
+  - package-ecosystem: "npm"
+    directory: "/api"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+      include: "scope"
+    groups:
+      npm-production:
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
+      npm-development:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- Base image for the API image ---------------------------------------
+  - package-ecosystem: "docker"
+    directory: "/api"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+      include: "scope"
+
+  # --- Base image for the web image ---------------------------------------
+  - package-ecosystem: "docker"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+      include: "scope"
+
+  # --- Images pinned in the Compose files ---------------------------------
+  # Postgres and Redis are third-party images referenced by tag rather than
+  # built here, so this is the only place a bump to them can be proposed.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+      include: "scope"
+
+  # --- The workflows themselves -------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
