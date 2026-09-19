@@ -1,0 +1,35 @@
+# Everything that has no business in a serverless deployment bundle.
+#
+# docs/ alone is ~4.5 MB of screenshots and a Word report, and none of it is
+# read at runtime. Keeping it out makes every deploy faster and the function
+# smaller.
+
+docs/
+.github/
+scripts/
+
+# Docker is the other way of running this project, not part of this one.
+Dockerfile
+*/Dockerfile
+*/Dockerfile.*
+docker-compose.yml
+docker-compose.override.yml
+.dockerignore
+*/.dockerignore
+
+# Repository furniture
+.idea/
+*.iml
+.DS_Store
+README.md
+*/README.md
+action.yml
+
+# Never upload real credentials. Configuration on Vercel comes from the
+# project's environment variables, not from a file.
+.env
+.env.*
+
+# nginx belongs to the Docker path. Vercel does its own routing via
+# vercel.json, and without this the file would be served at /web/nginx.conf.
+web/nginx.conf

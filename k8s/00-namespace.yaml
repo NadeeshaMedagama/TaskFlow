@@ -1,0 +1,15 @@
+# Everything TaskFlow owns lives in one namespace.
+#
+# Compose gave isolation for free: a project is its own network and its own
+# set of names. Kubernetes does not -- a cluster is flat unless you say
+# otherwise -- so the namespace is what replaces `networks: taskflow-net`.
+# It is also the DNS suffix: inside it, `taskflow-db` resolves without
+# qualification, which is exactly why the API's DB_HOST and the baked-in
+# nginx.conf upstream both keep working unchanged.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow
+    app.kubernetes.io/part-of: taskflow
