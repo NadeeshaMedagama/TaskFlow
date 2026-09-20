@@ -1,0 +1,26 @@
+# Non-secret configuration -- the half of .env that is safe to read.
+#
+# Under Compose the API got its whole environment from one `env_file: .env`,
+# which mixed connection details and credentials together. Kubernetes splits
+# that in two on purpose: this ConfigMap holds what anyone may see, and
+# 02-secret.yaml holds what they may not. The API consumes both with
+# `envFrom`, so it still sees one flat environment and its code is unchanged.
+#
+# DB_HOST and REDIS_HOST are Service names, resolved by cluster DNS exactly
+# the way Compose resolved service names on its bridge network.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: taskflow-config
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow
+    app.kubernetes.io/part-of: taskflow
+data:
+  DB_HOST: taskflow-db
+  DB_PORT: "5432"
+  DB_NAME: taskflow
+  REDIS_HOST: taskflow-cache
+  REDIS_PORT: "6379"
+  PORT: "4000"
+  NODE_ENV: production

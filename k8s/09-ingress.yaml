@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# The way in.
+#
+# Compose's `ports: ["8080:80"]` bound a container port to a host port, and
+# that was the whole story. An Ingress is a different idea: it is a ROUTING
+# RULE, evaluated by an ingress controller that is itself running in the
+# cluster. The rule says nothing about ports on your laptop -- it says "HTTP
+# traffic arriving at me for this path goes to this Service".
+#
+# That indirection is what buys you name-based virtual hosting, TLS
+# termination, and path routing later, none of which Compose could express.
+# It also means an Ingress does nothing at all until a controller is
+# installed to act on it. See the README: `minikube addons enable ingress`,
+# or the ingress-nginx manifest on kind.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: taskflow
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/part-of: taskflow
+spec:
+  # Which controller should act on this. `nginx` is the class that both
+  # ingress-nginx (kind) and the minikube ingress addon register. If
+  # `kubectl get ingressclass` shows a different name in your cluster, put
+  # that here instead.
+  ingressClassName: nginx
+  rules:
+    # No `host:` on purpose, so this matches any Host header and the app is
+    # reachable at plain http://localhost:8080 the moment the controller is
+    # up -- no /etc/hosts editing to get going.
+    #
+    # For the name-based version, which is what you would actually run,
+    # replace the line below with `- host: taskflow.local` (indented to match)
+    # and add this to /etc/hosts:
+    #
+    #     127.0.0.1  taskflow.local
+    #
+    # then browse to http://taskflow.local:8080.
+    - http:
+        paths:
+          - path: /
+            # Prefix, not Exact: one rule then covers /, /api/tasks and
+            # /health alike. All three go to the same place, because nginx
+            # inside taskflow-web is still the thing that splits static from
+            # proxied -- exactly as it did in Phase 1. The Ingress is not
+            # replacing that nginx, it is standing in front of it.
+            pathType: Prefix
+            backend:
+              service:
+                name: taskflow-web
+                port:
+                  name: http

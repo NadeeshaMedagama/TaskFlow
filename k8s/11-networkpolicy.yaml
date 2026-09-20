@@ -1,0 +1,143 @@
+# ---------------------------------------------------------------------------
+# Network isolation -- the translation of what Phase 1 did by OMISSION.
+#
+# The most-emphasised security property of docker-compose.yml was negative:
+# only taskflow-web had a `ports:` block, so the database and the cache were
+# unreachable from the host and from the LAN. That protection came from the
+# absence of a port mapping.
+#
+# A Kubernetes cluster is flat by default: every pod can reach every other pod
+# in every namespace, whether or not there is a Service. Leaving `ports:` out
+# buys you nothing here. The equivalent has to be stated, and this is it.
+#
+# ---------------------------------------------------------------------------
+# HONEST CAVEAT, read this before concluding anything from applying it.
+#
+# A NetworkPolicy is inert unless the cluster's CNI plugin implements it.
+# kind's default CNI (kindnet) does NOT, and neither does minikube's default.
+# These objects will be accepted by the API server, appear in `kubectl get
+# netpol`, and enforce absolutely nothing. That is not a bug in the manifest,
+# it is the plugin.
+#
+# To see it actually work:
+#   minikube start --cni=calico
+#   kind: create the cluster with `disableDefaultCNI: true` and install Calico
+#
+# It is included anyway because writing the policy is the lesson; a cluster
+# that silently ignores it is itself worth knowing about.
+# ---------------------------------------------------------------------------
+
+# 1. Deny all ingress to every pod in the namespace. An empty podSelector
+#    means "every pod here"; no `ingress:` rules at all means "nothing is
+#    allowed". Everything below re-opens exactly one path each.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/part-of: taskflow
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# 2. The web tier is the front door, so it accepts traffic from anywhere --
+#    which in practice means the ingress controller, and that lives in a
+#    different namespace. Narrowing this to the controller's namespace is a
+#    good exercise once you know its label.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-web-ingress
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/part-of: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-web
+      app.kubernetes.io/instance: taskflow
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 80
+          protocol: TCP
+---
+# 3. The API accepts from the web tier only. Nothing else in the cluster can
+#    reach port 4000 -- the direct equivalent of the API having no published
+#    port in Compose.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-from-web
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/part-of: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-api
+      app.kubernetes.io/instance: taskflow
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: taskflow-web
+              app.kubernetes.io/instance: taskflow
+      ports:
+        - port: 4000
+          protocol: TCP
+---
+# 4. Postgres accepts from the API only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-db-from-api
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/part-of: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-db
+      app.kubernetes.io/instance: taskflow
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: taskflow-api
+              app.kubernetes.io/instance: taskflow
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+# 5. Redis accepts from the API only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cache-from-api
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/part-of: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow-cache
+      app.kubernetes.io/instance: taskflow
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: taskflow-api
+              app.kubernetes.io/instance: taskflow
+      ports:
+        - port: 6379
+          protocol: TCP

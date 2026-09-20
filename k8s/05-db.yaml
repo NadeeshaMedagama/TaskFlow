@@ -1,0 +1,219 @@
+# ---------------------------------------------------------------------------
+# taskflow-db  --  PostgreSQL
+#
+# Compose service  ->  Deployment + Service + (the PVC in 04-db-pvc.yaml)
+#
+# A note on Deployment vs StatefulSet. A StatefulSet is the textbook answer for
+# a database: stable network identity, ordered rollout, and a
+# volumeClaimTemplate that gives every replica its own disk. It is used here
+# as a Deployment on purpose, because at one replica against one pre-declared
+# PVC the two behave identically, and the Phase 2 brief is about translating
+# Compose piece by piece -- a Compose service maps to a Deployment. The moment
+# you want a second Postgres (a replica, not a copy), this must become a
+# StatefulSet. That is the honest boundary of this translation.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-db
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-db
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: taskflow
+    app.kubernetes.io/version: "16"
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      # Selectors are immutable once created, so they carry only labels that
+      # never change. Anything versioned stays out.
+      app.kubernetes.io/name: taskflow-db
+      app.kubernetes.io/instance: taskflow
+  strategy:
+    # Recreate, NOT RollingUpdate. The PVC is ReadWriteOnce, so a rolling
+    # update -- which starts the new pod before stopping the old one -- would
+    # deadlock: the new pod cannot mount a volume the old pod still holds, and
+    # the old pod is not torn down until the new one is Ready. Recreate takes
+    # the brief outage instead. This is the single most common way a database
+    # Deployment is got wrong.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taskflow-db
+        app.kubernetes.io/instance: taskflow
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: taskflow
+        app.kubernetes.io/version: "16"
+    spec:
+      # Nothing in this pod talks to the Kubernetes API, so it gets no token.
+      automountServiceAccountToken: false
+      # Long enough for Postgres to finish a clean shutdown and flush.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            # Compose interpolated ${DB_USER} and friends from .env. Here the
+            # same three values come from the Secret and the ConfigMap, so the
+            # database and the API can still never drift apart -- they read the
+            # same objects.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: taskflow-secrets
+                  key: DB_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: taskflow-secrets
+                  key: DB_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: taskflow-config
+                  key: DB_NAME
+            # The data directory is a SUBDIRECTORY of the mount, not the mount
+            # itself. Some volume types hand you a filesystem root that is not
+            # empty (a lost+found directory is the classic case), and Postgres
+            # refuses to initialise into a non-empty directory. A subdirectory
+            # it creates itself is always clean.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          # Three probes doing three different jobs -- Compose had one
+          # healthcheck doing all of them badly.
+          #
+          #   startupProbe    "has it finished booting?"  Holds the other two
+          #                   off entirely while init.sql runs. This is what
+          #                   replaces Compose's start_period, and it is
+          #                   strictly better: a slow first boot extends the
+          #                   allowance instead of racing a fixed timer.
+          #   readinessProbe  "should it receive traffic?"  Failing this pulls
+          #                   the pod out of the Service's endpoints. Nothing
+          #                   is killed.
+          #   livenessProbe   "is it wedged?"  Failing this restarts the
+          #                   container, so it is kept deliberately slack -- a
+          #                   database that is merely busy must not be shot.
+          #
+          # -h 127.0.0.1 forces a TCP check rather than a unix-socket one, for
+          # the same reason it did under Compose: while init.sql is being
+          # applied the entrypoint runs a temporary server with an empty
+          # listen_addresses, which answers on the socket but not over TCP. A
+          # socket check would go green mid-initialisation and let the API in
+          # before the tasks table existed.
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - exec pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - exec pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - exec pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # Straight out of docker-compose.yml, which chose the
+          # `deploy.resources` form precisely so it would map 1:1:
+          #
+          #   deploy.resources.limits        ->  resources.limits
+          #   deploy.resources.reservations  ->  resources.requests
+          #
+          # requests are what the scheduler packs against; limits are what the
+          # kernel enforces. Unlike Compose, requests.cpu is genuinely honoured
+          # here -- it was inert on a local engine.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 750m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              # Drop everything, then add back ONLY what this image's entrypoint
+              # genuinely needs. Dropping ALL on its own does not work here:
+              # the official image starts as root, fixes ownership, and then
+              # drops to its own unprivileged user -- and every one of those
+              # steps is a capability.
+              #
+              #   CHOWN         chown the data directory
+              #   DAC_OVERRIDE  write into directories it does not own
+              #   FOWNER        chmod files owned by another user
+              #   SETUID/SETGID su-exec drops root to postgres
+              #
+              # Without them the container exits immediately with
+              # "Operation not permitted" -- which is exactly what happens if
+              # you delete any line below.
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+          # No runAsNonRoot here, deliberately. The official Postgres entrypoint
+          # starts as root to fix ownership of PGDATA and then drops to the
+          # postgres user with gosu. Forcing runAsUser breaks that on any
+          # storage class that hands over a root-owned directory.
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: taskflow-db-data
+        - name: init
+          configMap:
+            name: taskflow-db-init
+---
+# The Service is the stable name. Pods are cattle -- this one will get a new IP
+# every restart -- so nothing ever addresses a pod directly. `taskflow-db`
+# resolves via cluster DNS to this Service's ClusterIP, which forwards to
+# whichever pod is currently Ready.
+#
+# There is no NodePort and no LoadBalancer, which is the exact translation of
+# Compose's deliberate absence of a `ports:` block: the database is reachable
+# from inside the cluster and from nowhere else.
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-db
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-db
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: taskflow
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: taskflow-db
+    app.kubernetes.io/instance: taskflow
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
