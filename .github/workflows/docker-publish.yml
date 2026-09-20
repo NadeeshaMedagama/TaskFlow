@@ -75,8 +75,6 @@ jobs:
     name: Check credentials
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    outputs:
-      namespace: ${{ steps.check.outputs.namespace }}
     steps:
       - name: Verify the Docker Hub secrets are present
         id: check
@@ -102,9 +100,6 @@ jobs:
             echo "::error::Missing repository secret(s):${missing}. Add them under Settings -> Secrets and variables -> Actions, then re-run this workflow."
             exit 1
           fi
-
-          namespace="${DOCKERHUB_NAMESPACE:-$DOCKERHUB_USERNAME}"
-          echo "namespace=${namespace}" >> "$GITHUB_OUTPUT"
 
           if [ -n "$DOCKERHUB_TOKEN" ]; then
             echo "Credentials present (using DOCKERHUB_TOKEN)."
@@ -150,14 +145,16 @@ jobs:
       - name: Work out tags and labels
         id: meta
         env:
-          NAMESPACE: ${{ needs.preflight.outputs.namespace }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           INPUT_VERSION: ${{ inputs.version }}
           WANT_LATEST: ${{ inputs.latest }}
           IMAGE_NAME: ${{ matrix.image }}
           IMAGE_DESCRIPTION: ${{ matrix.description }}
         run: |
           set -euo pipefail
-          image="${NAMESPACE}/${IMAGE_NAME}"
+          namespace="${DOCKERHUB_NAMESPACE:-$DOCKERHUB_USERNAME}"
+          image="${namespace}/${IMAGE_NAME}"
 
           version="$INPUT_VERSION"
           if [ -z "$version" ]; then
@@ -257,12 +254,14 @@ jobs:
 
       - name: Inspect both manifests
         env:
-          NAMESPACE: ${{ needs.preflight.outputs.namespace }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           VERSION: ${{ needs.publish.outputs.version }}
         run: |
           set -euo pipefail
+          namespace="${DOCKERHUB_NAMESPACE:-$DOCKERHUB_USERNAME}"
           for name in taskflow-api taskflow-web; do
-            echo "::group::${NAMESPACE}/${name}:${VERSION}"
-            docker buildx imagetools inspect "${NAMESPACE}/${name}:${VERSION}"
+            echo "::group::${namespace}/${name}:${VERSION}"
+            docker buildx imagetools inspect "${namespace}/${name}:${VERSION}"
             echo "::endgroup::"
           done
