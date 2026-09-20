@@ -10,6 +10,8 @@ cp .env.example .env && docker compose up --build
 
 Then open **http://localhost:8080**.
 
+Production deployment: [TaskFlow_Live_App](https://task-flow-g3sn-h5uqhk1xo-nadeeshamedagamas-projects.vercel.app/)
+
 This is Phase 1 of a two-phase mentoring track. Phase 2 takes these same images
 to Kubernetes, so every choice here is deliberately boring and standard — see
 [Phase 2](#phase-2) below. The full brief and the submission report are in
