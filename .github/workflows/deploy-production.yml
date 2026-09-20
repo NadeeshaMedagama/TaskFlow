@@ -77,8 +77,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       version: ${{ steps.plan.outputs.version }}
-      api_image: ${{ steps.plan.outputs.api_image }}
-      web_image: ${{ steps.plan.outputs.web_image }}
       namespace: ${{ steps.plan.outputs.namespace }}
       registry: ${{ steps.plan.outputs.registry }}
     steps:
@@ -121,8 +119,6 @@ jobs:
             echo "version=${version}"
             echo "registry=${registry}"
             echo "namespace=${namespace}"
-            echo "api_image=${namespace}/taskflow-api:${version}"
-            echo "web_image=${namespace}/taskflow-web:${version}"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -169,10 +165,17 @@ jobs:
         # A deploy that points at a tag nobody published would fail on the
         # host instead, long after the approval. Catch it here.
         env:
-          API_IMAGE: ${{ needs.plan.outputs.api_image }}
-          WEB_IMAGE: ${{ needs.plan.outputs.web_image }}
+          NAMESPACE: ${{ needs.plan.outputs.namespace }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
+          if [ -z "$NAMESPACE" ] || [ -z "$VERSION" ]; then
+            echo "::error::The deployment plan did not produce an image namespace and version."
+            exit 1
+          fi
+
+          API_IMAGE="${NAMESPACE}/taskflow-api:${VERSION}"
+          WEB_IMAGE="${NAMESPACE}/taskflow-web:${VERSION}"
           missing=0
           for image in "$API_IMAGE" "$WEB_IMAGE"; do
             if docker buildx imagetools inspect "$image" > /dev/null 2>&1; then
@@ -242,10 +245,16 @@ jobs:
       - name: Deploy
         env:
           VERSION: ${{ needs.plan.outputs.version }}
-          API_IMAGE: ${{ needs.plan.outputs.api_image }}
-          WEB_IMAGE: ${{ needs.plan.outputs.web_image }}
+          NAMESPACE: ${{ needs.plan.outputs.namespace }}
         run: |
           set -euo pipefail
+          if [ -z "$NAMESPACE" ] || [ -z "$VERSION" ]; then
+            echo "::error::The deployment plan did not produce an image namespace and version."
+            exit 1
+          fi
+
+          API_IMAGE="${NAMESPACE}/taskflow-api:${VERSION}"
+          WEB_IMAGE="${NAMESPACE}/taskflow-web:${VERSION}"
 
           echo "Deploying TaskFlow ${VERSION}"
           echo "  api: ${API_IMAGE}"
