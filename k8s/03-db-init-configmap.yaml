@@ -1,0 +1,41 @@
+# The seed schema, as a ConfigMap.
+#
+# Under Compose this file was bind-mounted straight off the host into
+# /docker-entrypoint-initdb.d. A cluster has no host directory to mount, so the
+# file's CONTENT has to travel with the manifest -- which is what a ConfigMap
+# is for: small, non-secret files delivered to a pod as a volume.
+#
+# The Postgres image's behaviour is unchanged: it runs everything in
+# /docker-entrypoint-initdb.d exactly once, on first boot, when PGDATA is
+# empty. On every later start the PersistentVolumeClaim already has data and
+# this is ignored.
+#
+# This is a copy of api/db/init.sql. Regenerate it after changing that file:
+#
+#   kubectl create configmap taskflow-db-init \
+#     --namespace taskflow \
+#     --from-file=init.sql=api/db/init.sql \
+#     --dry-run=client -o yaml > k8s/03-db-init-configmap.yaml
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: taskflow-db-init
+  namespace: taskflow
+  labels:
+    app.kubernetes.io/name: taskflow-db
+    app.kubernetes.io/part-of: taskflow
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS tasks (
+      id SERIAL PRIMARY KEY,
+      title VARCHAR(255) NOT NULL,
+      description TEXT,
+      status VARCHAR(50) DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    INSERT INTO tasks (title, description, status) VALUES
+      ('Set up project repo', 'Initialize git and folder structure', 'done'),
+      ('Containerize the API', 'Write a production-grade Dockerfile', 'pending'),
+      ('Containerize the frontend', 'Serve static files via nginx', 'pending');

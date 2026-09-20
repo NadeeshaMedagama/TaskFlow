@@ -1,0 +1,46 @@
+# kind cluster definition for TaskFlow.
+#
+# This file is NOT a Kubernetes object and must never be given to kubectl --
+# it is kind's own config format. That is why it lives in this subdirectory:
+# `kubectl apply -f k8s/` reads the parent directory only, non-recursively, so
+# keeping it here stops it being picked up and rejected as an unknown kind.
+#
+#   kind create cluster --config k8s/cluster/kind-cluster.yaml
+#
+# Two things are being set up:
+#
+#   ingress-ready=true   the label ingress-nginx's kind manifest uses as a
+#                        nodeSelector. Without it the controller pod stays
+#                        Pending forever and the Ingress never works.
+#   extraPortMappings    kind runs the whole cluster inside a Docker
+#                        container, so a port on the node is not a port on
+#                        your laptop. These forward host 8080 -> node 80, and
+#                        8080 is chosen deliberately: it is the same address
+#                        Phase 1 used, so http://localhost:8080 keeps working
+#                        and the two phases are directly comparable.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: taskflow
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+
+  # Two workers, so the podAntiAffinity rules in 07-api.yaml and 08-web.yaml
+  # have somewhere to spread to and `kubectl get pods -o wide` shows replicas
+  # on different nodes. Delete both if you want a lighter cluster -- the
+  # manifests use `preferred` affinity precisely so one node still works.
+  - role: worker
+  - role: worker
