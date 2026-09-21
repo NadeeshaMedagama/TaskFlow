@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM nginx:1.27-alpine
+FROM nginx:1.31-alpine
 
 # The stock image's nginx.conf already does `include /etc/nginx/conf.d/*.conf`
 # inside its http block, so the server block belongs in conf.d. Overwriting
