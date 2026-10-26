@@ -60,7 +60,7 @@ jobs:
       publish: ${{ steps.resolve.outputs.publish }}
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -131,7 +131,7 @@ jobs:
     needs: [prepare]
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run the TaskFlow stack smoke test
         uses: ./
@@ -151,7 +151,7 @@ jobs:
       contents: write
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -226,7 +226,7 @@ jobs:
       contents: write
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # The tag job may have pushed the tag after this workflow started.

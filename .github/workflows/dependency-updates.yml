@@ -60,7 +60,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Full history so the update branch can be rebased onto the default
           # branch rather than force-pushed from a shallow clone.
